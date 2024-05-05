@@ -510,6 +510,7 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
 
         return output_dict
 
+
     def get_logprobs(self, batch, tokenizer):
         """
         Computes the log probabilities of a response using the model respectively.
@@ -538,67 +539,9 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
         device = self.pretrained_model.device  # Assumes the model has a 'device' attribute
 
         # Process inputs
-        prompt_ids = tokenizer(batch['prompt'], return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-        chosen_ids = tokenizer(batch['chosen'], return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-        rejected_ids = tokenizer(batch['rejected'], return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-
-
-        # Create masks for padding
-## labels padding_token = -100
-        chosen_ids[chosen_ids == 0] = -100
-        #print(chosen_mask)
-
-        # Get log probabilities for chosen responses
-        with torch.no_grad():
-            outputs_chosen = self.pretrained_model(input_ids=prompt_ids, labels=chosen_ids)
-            chosen_logps = -outputs_chosen.loss * chosen_ids.ne(-100).sum(dim=1).to(dtype=torch.float)  # Scale by the number of tokens
-
-        # Get log probabilities for rejected responses
-        with torch.no_grad():
-            outputs_rejected = self.pretrained_model(input_ids=prompt_ids, labels=rejected_ids)
-            rejected_logps = -outputs_rejected.loss * rejected_ids.ne(tokenizer.pad_token_id).sum(dim=1).to(dtype=torch.float)  # Scale by the number of tokens
-            
-        ###############################################################
-
-        return chosen_logps, rejected_logps
-
-
-    def get_logprobs3(self, batch, tokenizer):
-        """
-        Computes the log probabilities of a response using the model respectively.
-
-        Args:
-            batch (`dict` of `list`): A dictionary containing the input data for the DPO model.
-                The data format is as follows:
-                {
-                    "prompt": List[str],
-                    "chosen": List[str],
-                    "rejected": List[str],
-                    "chosen_logps": Optional(torch.FloatTensor)
-                    "rejected_logps": Optional(torch.FloatTensor)
-                }
-            tokenizer (`PreTrainedTokenizerBase`): The tokenizer used to tokenize the input data.
-        Returns:
-            A tuple of two tensors: (chosen_logps, rejected_logps)
-            chosen_logps (`torch.FloatTensor`):
-                Log probabilities of the chosen responses. Shape: (batch_size,)
-            rejected_logps (`torch.FloatTensor`):
-                Log probabilities of the rejected responses. Shape: (batch_size,)
-        """
-        ###############################################################
-        # TODO: Please implement your customized logprob computation here
-        # =============================================================
-        device = self.pretrained_model.device  # Assumes the model has a 'device' attribute
-
-        # Process inputs
-        prompt_ids = tokenizer(batch['prompt'], return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-        chosen_ids = tokenizer(batch['chosen'], return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-        rejected_ids = tokenizer(batch['rejected'], return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-
-
-        # Create masks for padding
-        #chosen_ids[chosen_ids == 0] = -100
-        #print(chosen_mask)
+        prompt_ids = tokenizer(batch['prompt'], return_tensors='pt', padding=True).input_ids.to(device)
+        chosen_ids = tokenizer(batch['chosen'], return_tensors='pt', padding=True).input_ids.to(device)
+        rejected_ids = tokenizer(batch['rejected'], return_tensors='pt', padding=True).input_ids.to(device)
 
         # Get log probabilities for chosen responses
         with torch.no_grad():
@@ -606,14 +549,11 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
             logits_chosen = outputs_chosen.logits
 
             log_probs = F.log_softmax(logits_chosen, dim=2)
-            # Labels need to be the same dimensions as logits for gather
-            # Unsqueezing labels to [batch, sequence, 1] to align with gather requirements
-            gather_indices = chosen_ids.unsqueeze(2)
 
-            # Gather the log probabilities using the updated gather_indices
+
+            gather_indices = chosen_ids.unsqueeze(2)
             selected_log_probs = torch.gather(log_probs, 2, gather_indices).squeeze(2)
 
-            # Assuming '2' is the padding label, create a mask
             mask = (chosen_ids != 0)
 
             # Apply mask, replacing padded positions with 0 (or a very small number)
@@ -622,10 +562,6 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
             # Now selected_log_probs_masked contains the log probabilities of non-padding tokens
             chosen_logps = selected_log_probs_masked.sum(dim=1)
 
-
-
-            #chosen_logps = -outputs_chosen.loss * chosen_ids.ne(-100).sum(dim=1).to(dtype=torch.float)  # Scale by the number of tokens
-
         # Get log probabilities for rejected responses
         with torch.no_grad():
             outputs_rejected = self.pretrained_model(input_ids=prompt_ids, labels=rejected_ids)
@@ -633,14 +569,10 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
             logits_rejected = outputs_rejected.logits
 
             log_probs = F.log_softmax(logits_rejected, dim=2)
-            # Labels need to be the same dimensions as logits for gather
-            # Unsqueezing labels to [batch, sequence, 1] to align with gather requirements
-            gather_indices = rejected_ids.unsqueeze(2)
 
-            # Gather the log probabilities using the updated gather_indices
+            gather_indices = rejected_ids.unsqueeze(2)
             selected_log_probs = torch.gather(log_probs, 2, gather_indices).squeeze(2)
 
-            # Assuming '2' is the padding label, create a mask
             mask = (rejected_ids != 0)
 
             # Apply mask, replacing padded positions with 0 (or a very small number)
@@ -648,71 +580,10 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
 
             # Now selected_log_probs_masked contains the log probabilities of non-padding tokens
             rejected_logps = selected_log_probs_masked.sum(dim=1)
-            
-            
-            #rejected_logps = -outputs_rejected.loss * rejected_ids.ne(tokenizer.pad_token_id).sum(dim=1).to(dtype=torch.float)  # Scale by the number of tokens
-            
+                        
         ###############################################################
 
         return chosen_logps, rejected_logps
-
-
-    def get_logprobs2(self, batch, tokenizer):
-        """
-        Computes the log probabilities of a response using the model respectively.
-
-        Args:
-            batch (`dict` of `list`): A dictionary containing the input data for the DPO model.
-                The data format is as follows:
-                {
-                    "prompt": List[str],
-                    "chosen": List[str],
-                    "rejected": List[str],
-                    "chosen_logps": Optional(torch.FloatTensor)
-                    "rejected_logps": Optional(torch.FloatTensor)
-                }
-            tokenizer (`PreTrainedTokenizerBase`): The tokenizer used to tokenize the input data.
-        Returns:
-            A tuple of two tensors: (chosen_logps, rejected_logps)
-            chosen_logps (`torch.FloatTensor`):
-                Log probabilities of the chosen responses. Shape: (batch_size,)
-            rejected_logps (`torch.FloatTensor`):
-                Log probabilities of the rejected responses. Shape: (batch_size,)
-        """
-        ###############################################################
-        # TODO: Please implement your customized logprob computation here
-        # =============================================================
-        device = self.pretrained_model.device  # Assumes the model has a 'device' attribute
-
-        # Process inputs
-        prompt_ids = tokenizer(batch['prompt'], return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-        chosen_ids = tokenizer(batch['chosen'], return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
-
-
-        # Assuming `input_ids` has been obtained as shown previously
-        decoder_start_token_id = self.pretrained_model.config.decoder_start_token_id
-        pad_token = self.pretrained_model.config.pad_token_id
-
-        # Generate an initial decoder_input_ids using the start token. This is for demonstration; adjust as needed.
-        decoder_input_ids = torch.tensor([[decoder_start_token_id]])
-
-        # Get log probabilities for chosen responses
-        outputs_chosen = self.pretrained_model(input_ids=prompt_ids, decoder_input_ids=decoder_input_ids)
-
-
-
-        print(torch.log_softmax(outputs_chosen.logits, dim=-1)[:,:,8942])
-
-        decoder_input_ids = torch.tensor([[8942, 1, 0, 0, 0]])
-        outputs_chosen = self.pretrained_model(input_ids=prompt_ids, decoder_input_ids=decoder_input_ids)
-
-        print(torch.log_softmax(outputs_chosen.logits, dim=-1))
-
-
-
-        ###############################################################
-
-        return chosen_logps, _
     
     def prediction_step_reward(
         self,
