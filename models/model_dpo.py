@@ -493,15 +493,23 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
         if self.is_peft_model and self.pretrained_model.active_peft_config.peft_type == "PREFIX_TUNING":
             kwargs.pop("past_key_values")
 
-        ouput_dict = {}
+
+        output_dict = {}
 
         ###############################################################
         # TODO: Please implement your customized forward pass here
         # =============================================================
-        raise NotImplementedError
+        model_outputs = self.pretrained_model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+
+        output_dict = {
+            'logits': model_outputs.get('logits', None),
+            'hidden_states': model_outputs.get('hidden_states', None),
+            'attentions': model_outputs.get('attentions', None)
+        }
         ###############################################################
 
-        return ouput_dict
+        return output_dict
+
 
     def get_logprobs(self, batch, tokenizer):
         """
@@ -528,11 +536,55 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
         ###############################################################
         # TODO: Please implement your customized logprob computation here
         # =============================================================
-        raise NotImplementedError
+        device = self.pretrained_model.device  # Assumes the model has a 'device' attribute
+
+        # Process inputs
+        prompt_ids = tokenizer(batch['prompt'], return_tensors='pt', padding=True).input_ids.to(device)
+        chosen_ids = tokenizer(batch['chosen'], return_tensors='pt', padding=True).input_ids.to(device)
+        rejected_ids = tokenizer(batch['rejected'], return_tensors='pt', padding=True).input_ids.to(device)
+
+        # Get log probabilities for chosen responses
+        with torch.no_grad():
+            outputs_chosen = self.pretrained_model(input_ids=prompt_ids, labels=chosen_ids)
+            logits_chosen = outputs_chosen.logits
+
+            log_probs = F.log_softmax(logits_chosen, dim=2)
+
+
+            gather_indices = chosen_ids.unsqueeze(2)
+            selected_log_probs = torch.gather(log_probs, 2, gather_indices).squeeze(2)
+
+            mask = (chosen_ids != 0)
+
+            # Apply mask, replacing padded positions with 0 (or a very small number)
+            selected_log_probs_masked = selected_log_probs * mask.float()
+
+            # Now selected_log_probs_masked contains the log probabilities of non-padding tokens
+            chosen_logps = selected_log_probs_masked.sum(dim=1)
+
+        # Get log probabilities for rejected responses
+        with torch.no_grad():
+            outputs_rejected = self.pretrained_model(input_ids=prompt_ids, labels=rejected_ids)
+            
+            logits_rejected = outputs_rejected.logits
+
+            log_probs = F.log_softmax(logits_rejected, dim=2)
+
+            gather_indices = rejected_ids.unsqueeze(2)
+            selected_log_probs = torch.gather(log_probs, 2, gather_indices).squeeze(2)
+
+            mask = (rejected_ids != 0)
+
+            # Apply mask, replacing padded positions with 0 (or a very small number)
+            selected_log_probs_masked = selected_log_probs * mask.float()
+
+            # Now selected_log_probs_masked contains the log probabilities of non-padding tokens
+            rejected_logps = selected_log_probs_masked.sum(dim=1)
+                        
         ###############################################################
 
         return chosen_logps, rejected_logps
-
+    
     def prediction_step_reward(
         self,
         policy_chosen_logps: torch.FloatTensor,
@@ -566,7 +618,11 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
         # TODO: Please implement the dpo loss function to compute the rewards
         # You need to return one reward score for each chosen and rejected response.
         # ======================================================================
-        raise NotImplementedError
+        # Calculate rewards for chosen responses
+        output_dict["chosen_rewards"] = policy_chosen_logps - reference_chosen_logps
+
+        # Calculate rewards for rejected responses
+        output_dict["rejected_rewards"] = policy_rejected_logps - reference_rejected_logps
         ########################################################################
 
         return output_dict

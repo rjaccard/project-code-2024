@@ -9,3 +9,6 @@ accelerate
 torch
 bitsandbytes
 peft
+scikit-learn
+rouge_score
+bert_score
