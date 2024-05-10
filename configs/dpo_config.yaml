@@ -1,0 +1,14 @@
+model_name: "google/flan-t5-small"
+train_dataset: "./datasets/dpo_preference_example.jsonl"
+val_dataset: "val_dataset.pt"
+output_dir: "./output"
+logging_dir: "./logs"
+batch_size: 1
+num_epochs: 10
+logging_steps: 100
+save_steps: 500
+dev_mode: 1
+save_total_limit: 2
+optimization_type: "lora"  # "lora" or "full_fine_tuning"
+model_type: "full_fine_tuning"  # "lora" or "full_fine_tuning
+checkpoint_path: "checkpoint-1000"  # Required only for full_fine_tuning
