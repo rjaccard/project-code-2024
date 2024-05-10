@@ -545,7 +545,7 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
 
         # Get log probabilities for chosen responses
         with torch.no_grad():
-            outputs_chosen = self.pretrained_model(input_ids=prompt_ids, labels=chosen_ids)
+            outputs_chosen = self.pretrained_model(input_ids=prompt_ids, decoder_input_ids=chosen_ids)
             logits_chosen = outputs_chosen.logits
 
             log_probs = F.log_softmax(logits_chosen, dim=2)
@@ -564,7 +564,7 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
 
         # Get log probabilities for rejected responses
         with torch.no_grad():
-            outputs_rejected = self.pretrained_model(input_ids=prompt_ids, labels=rejected_ids)
+            outputs_rejected = self.pretrained_model(input_ids=prompt_ids, decoder_input_ids=rejected_ids)
             
             logits_rejected = outputs_rejected.logits
 
