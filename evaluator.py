@@ -105,6 +105,8 @@ class DPOModelEvaluator():
         output_dict = model.prediction_step_mcqa(batch, tokenizer)
         preds = output_dict["preds"]
         return preds
+    
+    
 
     def scoring_mcqa(self, test_dataloader: DataLoader):
         """Computing the accuracy of the multiple-choice question predictions from a DPO model.
@@ -117,6 +119,18 @@ class DPOModelEvaluator():
         all_policy_preds = []
         all_labels = []
 
+        def letters_to_integers(letters):
+            result = []
+            for letter in letters:
+                # Check if the character is a letter
+                if letter.isalpha():
+                    # Convert letter to its alphabetical index (1-based)
+                    result.append(ord(letter.upper()) - ord('A') + 1)
+                else:
+                    # Map non-letter characters to 0
+                    result.append(0)
+            return result
+
         # Load the policy model from the policy model path
         policy_model = self.model_class.from_pretrained(
             self.policy_model_path,
@@ -127,15 +141,17 @@ class DPOModelEvaluator():
             policy_preds = self.get_batch_predictions_mcqa(
                 policy_model, self.policy_tokenizer, batch)
             all_policy_preds.extend(policy_preds)
-            all_labels.extend(batch["labels"])
+            all_labels.extend(batch["answer"])
 
         # Clear the GPU memory allocated for the policy model
         del policy_model
         torch.cuda.empty_cache()
 
+
         policy_accuracy = accuracy_metric.compute(
-            references=all_labels, predictions=all_policy_preds)
+            references=letters_to_integers(all_labels), predictions=letters_to_integers(all_policy_preds))
         return policy_accuracy
+    
 
     def get_batch_predictions_reward(
         self,
@@ -192,11 +208,12 @@ class DPOModelEvaluator():
         test_data_map = {}
         for data in test_data:
             test_data_map[data['prompt']] = {}
-        test_dataloader = DataLoader(test_data, batch_size=8)
+        test_dataloader = DataLoader(test_data, batch_size=32)
         reference_model = self.model_class.from_pretrained(
             self.reference_model_path)
 
         for idx, batch in enumerate(test_dataloader):
+            print(idx)
             try:
                 chosen_logps, rejected_logps = reference_model.get_logprobs(batch, self.reference_tokenizer)
             except Exception as e:
@@ -243,6 +260,7 @@ class DPOModelEvaluator():
         )
 
         for idx, batch in enumerate(test_dataloader):
+            print(idx)
             try:
                 reference_chosen_logps = batch["chosen_logps"]
                 reference_rejected_logps = batch["rejected_logps"]
@@ -259,6 +277,8 @@ class DPOModelEvaluator():
                 continue
             policy_chosen_rewards.extend(rewards[0])
             policy_rejected_rewards.extend(rewards[1])
+            print(rewards[0])
+            print(rewards[1])
 
         policy_chosen_rewards = np.array(policy_chosen_rewards)
         policy_rejected_rewards = np.array(policy_rejected_rewards)
@@ -363,6 +383,8 @@ if __name__ == '__main__':
     # Basic repository check to ensure the submission is correct
     repository_check()
 
+    print('hey')
+
     # Load the main configuration file
     main_config = {}
     with open("main_config.yaml") as f:
@@ -399,12 +421,14 @@ if __name__ == '__main__':
 
     # Initialize the evaluator based on the evaluation method and compute the metrics
     if "reward" in eval_method:
+        print('reward')
         evaluator = DPOModelEvaluator(
             task_type=task_type,
             policy_model_path=policy_model_path,
             reference_model_path=reference_model_path,
             dpo_model_args=dpo_model_args
         )
+        print('compute log probs')
         # Compute the log probabilities of the reference model for the test data
         new_test_data = evaluator.compute_reference_logprobs(test_data)
         test_dataloader = DataLoader(new_test_data, batch_size=8)
@@ -413,6 +437,7 @@ if __name__ == '__main__':
         metrics["policy_reward_accuracy"] = policy_reward_acc
 
     elif "mcqa" in eval_method:
+        print('go')
         test_dataloader = DataLoader(test_data, batch_size=8)
         evaluator = DPOModelEvaluator(
             task_type=task_type,

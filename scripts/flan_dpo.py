@@ -89,7 +89,7 @@ def train_model_fft_with_fft(config, device):
 
 
     dataset = prepare_dataset(config, tokenizer, config['dev_mode'])
-
+    print(dataset)
     # Training arguments
     training_args = TrainingArguments(
         per_device_train_batch_size=config['batch_size'],
@@ -211,15 +211,15 @@ def train_model_fft_with_lora(config, device):
 
 
 if __name__ == "__main__":
-    config_file = "configs/new.yaml"
+    config_file = "configs/dpo_config.yaml"
     config = load_config(config_file)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
 
-    #os.environ["WANDB_PROJECT"] = "DPO"
-    #os.environ["WANDB_LOG_MODEL"] = "false"
-    #wandb.login(key="fad71e617dcfeda74b0dd47918dee01c2363a521")
+    os.environ["WANDB_PROJECT"] = "DPO"
+    os.environ["WANDB_LOG_MODEL"] = "false"
+    wandb.login(key="fad71e617dcfeda74b0dd47918dee01c2363a521")
 
     if config['optimization_type'] == 'lora' and config['model_type'] == 'lora':
         train_model_lora_with_lora(config, device)

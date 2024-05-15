@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM
 from models.model_base import PreTrainedModelWrapper
 
+import re
+
 class AutoDPOModelForCausalLM(PreTrainedModelWrapper):
     """
     An autoregressive model with support for custom modules in addition to the language model.
@@ -501,6 +503,7 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
         # =============================================================
         model_outputs = self.pretrained_model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
 
+        print('lala')
         output_dict = {
             'logits': model_outputs.get('logits', None),
             'hidden_states': model_outputs.get('hidden_states', None),
@@ -537,7 +540,7 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
         # TODO: Please implement your customized logprob computation here
         # =============================================================
         device = self.pretrained_model.device  # Assumes the model has a 'device' attribute
-
+        print(device)
         # Process inputs
         prompt_ids = tokenizer(batch['prompt'], return_tensors='pt', padding=True).input_ids.to(device)
         chosen_ids = tokenizer(batch['chosen'], return_tensors='pt', padding=True).input_ids.to(device)
@@ -637,7 +640,6 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
                 The data format is as follows:
                 {
                     "question": str,
-                    "choices": List[str],
                     "answer": str,
                 }
             tokenizer (`PreTrainedTokenizerBase`): The tokenizer used to tokenize the input questions.
@@ -646,12 +648,72 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
         """
         output_dict = {"preds": []}
 
+        print(batch)
         ########################################################################
         # TODO: Please implement the prediction step that generates the prediction of the given MCQA question
         # ======================================================================
         # You need to return one letter prediction for each question.
         # ======================================================================
-        raise NotImplementedError
+# Addition text to guide the model for prediction
+        # 46% addition = "I give you a question and its answer. What is the letter of the correct answer as suggested in the answer? The correct letter is:"
+        final_text = "I am a student and need an answer to the following question. Choose the correct option and add a scientifically accurate short text that explain the answer. Please use clear, precise language suitable for an academic audience."
+        addition = "I repeat, the correct letter is:" # 81% large
+        model = self.transformers_parent_class.from_pretrained("google/flan-t5-xl")
+
+        # Process each question-answer pair in the batch
+        questions = batch['question']
+        answers = batch['answer']
+
+        def clean_string(input_string):
+            # Define a pattern that matches <pad>, </s>, ., and any whitespace
+            pattern = r'(<pad>|</s>|\s+)'
+            # Use re.sub to replace all occurrences of the pattern with an empty string
+            cleaned_string = re.sub(pattern, '', input_string)
+            return cleaned_string
+        
+        for item in zip(questions, answers):
+            question = item[0]
+            q = tokenizer(question, return_tensors='pt')
+
+
+            # true answer
+            #answer = item[1]
+            # answer of our model
+            answer = self.pretrained_model.generate(**q)
+            answer = clean_string(tokenizer.decode(answer[0]))
+    
+            # Combine the question, answer, and additional guiding text
+            text = final_text + question + ' ' + answer + '\n\n' + addition
+            
+            print(text)
+            # Tokenize the text
+            inputs = tokenizer(text, return_tensors='pt')
+
+            # Move tensors to the same device as model
+            inputs = {key: value.to(model.device) for key, value in inputs.items()}
+
+            # Model prediction
+            with torch.no_grad():
+                outputs = model(**inputs, decoder_input_ids=torch.tensor([[0]]))
+
+            # Assuming the model outputs logits or probabilities
+            logits = outputs.logits
+
+            # Convert logits to probabilities
+            probs = torch.softmax(logits, dim=-1)
+
+            # Find the index of the highest probability which corresponds to the answer
+            pred_idx = torch.argmax(probs, dim=-1)
+
+            print(pred_idx)
+            print(tokenizer.decode(pred_idx[0]))
+
+            # Assuming the answers are mapped to labels like 0:'A', 1:'B', 2:'C', 3:'D', ...
+            pred_letter = tokenizer.decode(pred_idx[0])
+
+            # Append the predicted letter to the output dictionary
+            output_dict["preds"].append(pred_letter)
+
         ########################################################################
 
         return output_dict
