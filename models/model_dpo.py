@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM
 from models.model_base import PreTrainedModelWrapper
+from models.model_rag import RAG
 
 import re
 
@@ -355,6 +356,14 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
             if any(attribute in name for attribute in self.lm_head_namings):
                 return True
         return False
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model, *model_args, **kwargs):
+        if "rag" in pretrained_model:  # Check if it's a RAG model
+            rag = RAG(pretrained_model, **kwargs)
+            return rag
+        else : # Call the parent class
+            return super().from_pretrained(pretrained_model, *model_args, **kwargs)
 
     def _init_weights(self, **kwargs):
         """
