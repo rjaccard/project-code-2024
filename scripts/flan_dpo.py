@@ -47,7 +47,7 @@ def preprocess_function(examples, tokenizer, prefix="Please answer the question:
 
 
     model_inputs["chosen"] = chosen["input_ids"]
-    model_inputs["rejected"] = chosen["input_ids"]
+    model_inputs["rejected"] = rejected["input_ids"]
 
     return model_inputs
 
@@ -95,11 +95,16 @@ def train_model_fft_with_fft(config, device):
         per_device_train_batch_size=config['batch_size'],
         gradient_accumulation_steps=config['batch_size'],
         num_train_epochs=config['num_epochs'],
+
+        evaluation_strategy="steps",
+        eval_steps=1000,
+        save_strategy="epoch",
+        
         output_dir=config['output_dir'],
         overwrite_output_dir=True,
         logging_steps=config['logging_steps'],
         logging_dir=config['logging_dir'],
-        save_steps=config['save_steps'],
+        save_steps=10000,
         report_to="wandb",
         auto_find_batch_size=True,
         #gradient_checkpointing=True,
@@ -124,12 +129,14 @@ def train_model_fft_with_fft(config, device):
         eval_dataset=dataset['test'],
         tokenizer=tokenizer,
         #data_collator=data_collator,
-        beta=0.1,
+        beta=10,
         max_target_length=512,
         max_prompt_length=max_prompt_length,
         max_length=max_length)
 
     dpo_trainer.train()
+    dpo_trainer.save_model(config['output_dir'] + "/full_model")
+
 
 
 
@@ -200,7 +207,7 @@ def train_model_fft_with_lora(config, device):
         eval_dataset=dataset['test'],
         tokenizer=tokenizer,
         #data_collator=data_collator,
-        beta=0.1,
+        beta=10,
         max_target_length=512,
         max_prompt_length=max_prompt_length,
         max_length=max_length)

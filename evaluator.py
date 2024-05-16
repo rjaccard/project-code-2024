@@ -208,10 +208,14 @@ class DPOModelEvaluator():
         test_data_map = {}
         for data in test_data:
             test_data_map[data['prompt']] = {}
-        test_dataloader = DataLoader(test_data, batch_size=32)
+        test_dataloader = DataLoader(test_data, batch_size=8)
         reference_model = self.model_class.from_pretrained(
             self.reference_model_path)
 
+
+
+        print('ref device')
+        print(reference_model.pretrained_model.device)
         for idx, batch in enumerate(test_dataloader):
             print(idx)
             try:

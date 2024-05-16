@@ -403,6 +403,9 @@ class PreTrainedModelWrapper(nn.Module):
         elif is_npu_available():
             return f"npu:{state.local_process_index}"
         else:
+            print('cuda' if torch.cuda.is_available() else 'cpu')
+            print(state.local_process_index if torch.cuda.is_available() else "cpu")
+            return 'cuda' if torch.cuda.is_available() else 'cpu'
             return state.local_process_index if torch.cuda.is_available() else "cpu"
 
     @classmethod

@@ -539,50 +539,36 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
         ###############################################################
         # TODO: Please implement your customized logprob computation here
         # =============================================================
-        device = self.pretrained_model.device  # Assumes the model has a 'device' attribute
-        print(device)
+        #print(device)
+        
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        #self.pretrained_model.to(device)  # Assumes the model has a 'device' attribute
+
         # Process inputs
         prompt_ids = tokenizer(batch['prompt'], return_tensors='pt', padding=True).input_ids.to(device)
         chosen_ids = tokenizer(batch['chosen'], return_tensors='pt', padding=True).input_ids.to(device)
         rejected_ids = tokenizer(batch['rejected'], return_tensors='pt', padding=True).input_ids.to(device)
 
-        # Get log probabilities for chosen responses
-        with torch.no_grad():
-            outputs_chosen = self.pretrained_model(input_ids=prompt_ids, decoder_input_ids=chosen_ids)
-            logits_chosen = outputs_chosen.logits
+        self.pretrained_model.to(device)
+        def compute_log_probs(input_ids, target_ids):
+            with torch.no_grad():
+                outputs = self.pretrained_model(input_ids=input_ids, decoder_input_ids=target_ids)
+                logits = outputs.logits
 
-            log_probs = F.log_softmax(logits_chosen, dim=2)
+                log_probs = F.log_softmax(logits, dim=2)
+                gather_indices = target_ids.unsqueeze(2)
+                selected_log_probs = torch.gather(log_probs, 2, gather_indices).squeeze(2)
 
+                mask = (target_ids != 0)
+                selected_log_probs_masked = selected_log_probs * mask.float()
 
-            gather_indices = chosen_ids.unsqueeze(2)
-            selected_log_probs = torch.gather(log_probs, 2, gather_indices).squeeze(2)
+                return selected_log_probs_masked.sum(dim=1)
 
-            mask = (chosen_ids != 0)
+        # Compute log probabilities for chosen and rejected responses
+        chosen_logps = compute_log_probs(prompt_ids, chosen_ids).cpu()
+        rejected_logps = compute_log_probs(prompt_ids, rejected_ids).cpu()
 
-            # Apply mask, replacing padded positions with 0 (or a very small number)
-            selected_log_probs_masked = selected_log_probs * mask.float()
-
-            # Now selected_log_probs_masked contains the log probabilities of non-padding tokens
-            chosen_logps = selected_log_probs_masked.sum(dim=1)
-
-        # Get log probabilities for rejected responses
-        with torch.no_grad():
-            outputs_rejected = self.pretrained_model(input_ids=prompt_ids, decoder_input_ids=rejected_ids)
-            
-            logits_rejected = outputs_rejected.logits
-
-            log_probs = F.log_softmax(logits_rejected, dim=2)
-
-            gather_indices = rejected_ids.unsqueeze(2)
-            selected_log_probs = torch.gather(log_probs, 2, gather_indices).squeeze(2)
-
-            mask = (rejected_ids != 0)
-
-            # Apply mask, replacing padded positions with 0 (or a very small number)
-            selected_log_probs_masked = selected_log_probs * mask.float()
-
-            # Now selected_log_probs_masked contains the log probabilities of non-padding tokens
-            rejected_logps = selected_log_probs_masked.sum(dim=1)
+        torch.cuda.empty_cache()
                         
         ###############################################################
 
