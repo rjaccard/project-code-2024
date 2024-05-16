@@ -4,11 +4,14 @@
 "policy_model_path": "google/flan-t5-xl" # Your path to the final checkpoint
 "reference_model_path": "google/flan-t5-small" # The repo id of your pretrained reference model
 "quantized_policy_model_path": "./checkpoints/best_model_quantized/" # Your path to the final quantized checkpoint
-"rag_policy_model_path": "./checkpoints/best_model_rag/" # Your path to the final RAG checkpoint
+"rag_policy_model_path": "checkpoints/rag_model" # Your path to the final RAG checkpoint
 "test_data_path": "./datasets/mcqa_example.jsonl" # Your path to the test data
 "dpo_model_args": null # Put any model arguments required to load your DPO model below
 "rag_model_args": # Put any model arguments required to load your rag model below
-  "encoder_model_path": "facebook/bart-large"
-  "retriever_model_path": "./checkpoints/rag_retriever"
-  "document_dir": "./data/documents"
+  "rag_name_or_path": "facebook/rag-token-nq"
+  "generator_name_or_path": "google/flan-t5-small"    # Should be path to our pre-trained model
+  "question_encoder_name_or_path" : "facebook/dpr-question_encoder-single-nq-base"
+  "dataset_path" : "datasets/rag/rag_dataset"
+  "index_path" : "datasets/rag/rag_dataset_index.faiss"
+  "rag_save_dir" : "checkpoints/rag_model/"
 "quantized_model_args": null # Put any model arguments required to load your quantized model below
