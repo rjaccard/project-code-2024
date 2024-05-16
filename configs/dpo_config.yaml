@@ -1,15 +1,13 @@
-model_name: "google/flan-t5-large"
+model_path: "google/flan-t5-large"
 train_dataset: "./datasets/class_train.jsonl"
 test_dataset: "./datasets/class_test.jsonl"
-val_dataset: "val_dataset.pt"
 output_dir: "./output"
-logging_dir: "./logs"
 batch_size: 1
-num_epochs: 3
+beta: 0.1
+num_epochs: 1
 logging_steps: 100
-save_steps: 500
-dev_mode: 0
-save_total_limit: 2
+eval_steps: 5000
+lr: 2e-5
+lr_scheduler: "linear" # "constant" "cosine"
 optimization_type: "full_fine_tuning"  # "lora" or "full_fine_tuning"
 model_type: "full_fine_tuning"  # "lora" or "full_fine_tuning
-checkpoint_path: "checkpoint-1000"  # Required only for full_fine_tuning
