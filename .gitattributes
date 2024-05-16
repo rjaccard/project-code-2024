@@ -1,1 +1,2 @@
 datasets/** filter=lfs diff=lfs merge=lfs -text
+checkpoints/rag_model/* filter=lfs diff=lfs merge=lfs -text
