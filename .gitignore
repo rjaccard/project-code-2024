@@ -127,6 +127,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.venv2
 
 # Spyder project settings
 .spyderproject
@@ -160,3 +161,9 @@ cython_debug/
 #.idea/
 /wandb
 /logs
+/checkpoints
+/notebooks/sft/mmlu_gpt.hf
+/datasets/class_sft_datasetdict/
+/datasets/class_test.jsonl
+/datasets/class_train.jsonl
+/datasets/M1_preference_data_15052024.json

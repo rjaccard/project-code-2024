@@ -13,10 +13,6 @@ model:
     lora_dropout: 0.05
     learning_rate: 1.0e-4
     num_epochs: 2
-
-
-data:
-  dataset_name: "meta-math/MetaMathQA"
   
 wandb:
   project_name: "flan-t5-sft"
