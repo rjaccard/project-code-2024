@@ -522,7 +522,6 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
 
         return output_dict
 
-
     def get_logprobs(self, batch, tokenizer):
         """
         Computes the log probabilities of a response using the model respectively.
@@ -553,35 +552,41 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         #self.pretrained_model.to(device)  # Assumes the model has a 'device' attribute
 
+
         # Process inputs
-        prompt_ids = tokenizer(batch['prompt'], return_tensors='pt', padding=True).input_ids.to(device)
-        chosen_ids = tokenizer(batch['chosen'], return_tensors='pt', padding=True).input_ids.to(device)
-        rejected_ids = tokenizer(batch['rejected'], return_tensors='pt', padding=True).input_ids.to(device)
+        prompt_ids = tokenizer(batch['prompt'], return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+        prompt_ids_attention = tokenizer(batch['prompt'], return_tensors='pt', padding=True, truncation=True).attention_mask.to(device)
+        chosen_ids = tokenizer(batch['chosen'], return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
+        rejected_ids = tokenizer(batch['rejected'], return_tensors='pt', padding=True, truncation=True).input_ids.to(device)
 
         self.pretrained_model.to(device)
-        def compute_log_probs(input_ids, target_ids):
+        def compute_log_probs(input_ids, prompt_ids_attention, target_ids):
             with torch.no_grad():
-                outputs = self.pretrained_model(input_ids=input_ids, decoder_input_ids=target_ids)
-                logits = outputs.logits
+                outputs = self.pretrained_model(input_ids=input_ids, attention_mask=prompt_ids_attention, labels=target_ids)
 
+                logits = outputs.logits
                 log_probs = F.log_softmax(logits, dim=2)
                 gather_indices = target_ids.unsqueeze(2)
                 selected_log_probs = torch.gather(log_probs, 2, gather_indices).squeeze(2)
 
                 mask = (target_ids != 0)
                 selected_log_probs_masked = selected_log_probs * mask.float()
-
+                print(selected_log_probs_masked.sum(dim=1))
                 return selected_log_probs_masked.sum(dim=1)
 
         # Compute log probabilities for chosen and rejected responses
-        chosen_logps = compute_log_probs(prompt_ids, chosen_ids).cpu()
-        rejected_logps = compute_log_probs(prompt_ids, rejected_ids).cpu()
+        chosen_logps = compute_log_probs(prompt_ids, prompt_ids_attention, chosen_ids).cpu()
+        rejected_logps = compute_log_probs(prompt_ids, prompt_ids_attention, rejected_ids).cpu()
 
         torch.cuda.empty_cache()
                         
         ###############################################################
 
         return chosen_logps, rejected_logps
+
+
+
+
     
     def prediction_step_reward(
         self,

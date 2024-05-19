@@ -23,7 +23,7 @@ def load_config(config_file):
     return config
 
 
-def train_model_fft_with_fft(config, device):
+def train_model_fft_with_fft(config):
     # Load tokenizer and model
 
     tokenizer = AutoTokenizer.from_pretrained(config['model_path'])
@@ -35,8 +35,10 @@ def train_model_fft_with_fft(config, device):
 
     # Training arguments
     training_args = TrainingArguments(
+        #gradient_accumulation_steps=8,
+
         num_train_epochs=config['num_epochs'],
-        evaluation_strategy="steps",
+        evaluation_strategy="epoch",
         eval_steps=config['eval_steps'],
         save_strategy="epoch",
         output_dir=config['output_dir'],
@@ -54,24 +56,25 @@ def train_model_fft_with_fft(config, device):
 
     dpo_trainer = DPOTrainer(
         model=model,
+        loss_type='sigmoid',
         args=training_args,
         train_dataset=dataset_train['train'],
         eval_dataset=dataset_test['train'],
         tokenizer=tokenizer,
         beta=config['beta'],
         max_target_length=max_prompt_length,
-        max_prompt_length=max_length,
+        max_prompt_length=max_prompt_length,
         max_length=max_length)
 
     dpo_trainer.train()
     dpo_trainer.save_model(config['output_dir'] + "/full_model")
 
 
-def train_model_lora_with_lora(config, device):
+def train_model_lora_with_lora(config):
     pass
-def train_model_lora_with_fft(config, device):
+def train_model_lora_with_fft(config):
     pass
-def train_model_fft_with_lora(config, device):
+def train_model_fft_with_lora(config):
 
     # Load tokenizer and model
     print('Loooora')
@@ -96,7 +99,7 @@ def train_model_fft_with_lora(config, device):
     # Training arguments
     training_args = TrainingArguments(
         num_train_epochs=config['num_epochs'],
-        evaluation_strategy="steps",
+        evaluation_strategy="epoch",
         eval_steps=config['eval_steps'],
         save_strategy="epoch",
         output_dir=config['output_dir'],
@@ -117,10 +120,10 @@ def train_model_fft_with_lora(config, device):
         model=peft_model,
         args=training_args,
         train_dataset=dataset_train['train'],
-        eval_dataset=dataset_test['test'],
+        eval_dataset=dataset_test['train'],
         tokenizer=tokenizer,
         beta=config['beta'],
-        max_target_length=max_length,
+        max_target_length=max_prompt_length,
         max_prompt_length=max_prompt_length,
         max_length=max_length)
 
@@ -136,12 +139,12 @@ if __name__ == "__main__":
     wandb.login(key="fad71e617dcfeda74b0dd47918dee01c2363a521")
 
     if config['optimization_type'] == 'lora' and config['model_type'] == 'lora':
-        train_model_lora_with_lora(config, device)
+        train_model_lora_with_lora(config)
     elif config['optimization_type'] == 'lora' and config['model_type'] == 'full_fine_tuning':
-        train_model_fft_with_lora(config, device)
+        train_model_fft_with_lora(config)
     elif config['optimization_type'] == 'full_fine_tuning' and config['model_type'] == 'lora':
-        train_model_lora_with_fft(config, device)
+        train_model_lora_with_fft(config)
     elif config['optimization_type'] == 'full_fine_tuning' and config['model_type'] == 'full_fine_tuning':
-        train_model_fft_with_fft(config, device)
+        train_model_fft_with_fft(config)
     else:
         print("Invalid optimization or model type. Choose either 'lora' or 'full_fine_tuning'.")
