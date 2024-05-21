@@ -7,7 +7,7 @@ beta: 0.1
 num_epochs: 1
 logging_steps: 100
 eval_steps: 1000
-lr: 2.0e-5
+lr: 8.0e-6
 lr_scheduler: "constant" # "constant" "cosine" "linear"
 optimization_type: "full_fine_tuning"  # "lora" or "full_fine_tuning"
 model_type: "full_fine_tuning"  # "lora" or "full_fine_tuning
