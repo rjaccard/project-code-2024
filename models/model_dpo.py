@@ -572,7 +572,9 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
                 mask = (target_ids != 0)
                 selected_log_probs_masked = selected_log_probs * mask.float()
                 print(selected_log_probs_masked.sum(dim=1))
-                return selected_log_probs_masked.sum(dim=1)
+                print(mask.float().sum(-1))
+                print(selected_log_probs_masked.sum(dim=1) / mask.float().sum(-1))
+                return selected_log_probs_masked.sum(dim=1) / mask.float().sum(-1)
 
         # Compute log probabilities for chosen and rejected responses
         chosen_logps = compute_log_probs(prompt_ids, prompt_ids_attention, chosen_ids).cpu()
@@ -648,7 +650,6 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
         """
         output_dict = {"preds": []}
 
-        print(batch)
         ########################################################################
         # TODO: Please implement the prediction step that generates the prediction of the given MCQA question
         # ======================================================================
@@ -656,63 +657,44 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
         # ======================================================================
 # Addition text to guide the model for prediction
         # 46% addition = "I give you a question and its answer. What is the letter of the correct answer as suggested in the answer? The correct letter is:"
-        final_text = "I am a student and need an answer to the following question. Choose the correct option and add a scientifically accurate short text that explain the answer. Please use clear, precise language suitable for an academic audience."
-        addition = "I repeat, the correct letter is:" # 81% large
-        model = self.transformers_parent_class.from_pretrained("google/flan-t5-xl")
+        start_text = "The following are multiple choice questions (with answers) about STEM.\n\n"
+                
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.pretrained_model.to(device)
 
         # Process each question-answer pair in the batch
         questions = batch['question']
         answers = batch['answer']
-
-        def clean_string(input_string):
-            # Define a pattern that matches <pad>, </s>, ., and any whitespace
-            pattern = r'(<pad>|</s>|\s+)'
-            # Use re.sub to replace all occurrences of the pattern with an empty string
-            cleaned_string = re.sub(pattern, '', input_string)
-            return cleaned_string
-        
         for item in zip(questions, answers):
-            question = item[0]
-            q = tokenizer(question, return_tensors='pt')
 
+            question = start_text + item[0] + " " + tokenizer.eos_token
 
-            # true answer
-            #answer = item[1]
-            # answer of our model
-            answer = self.pretrained_model.generate(**q)
-            answer = clean_string(tokenizer.decode(answer[0]))
-    
-            # Combine the question, answer, and additional guiding text
-            text = final_text + question + ' ' + answer + '\n\n' + addition
-            
-            print(text)
-            # Tokenize the text
-            inputs = tokenizer(text, return_tensors='pt')
+            tokens = tokenizer(question, return_tensors="pt")
 
-            # Move tensors to the same device as model
-            inputs = {key: value.to(model.device) for key, value in inputs.items()}
+            letters_pattern = re.compile(r'\n([A-Z])\. ')
+            matches = letters_pattern.findall(question.split('\nOptions:', 1)[1])
 
-            # Model prediction
+            decoder_start_token_id = self.pretrained_model.config.decoder_start_token_id
+            decoder_input_ids = torch.tensor([[decoder_start_token_id]]).to(device)
+
             with torch.no_grad():
-                outputs = model(**inputs, decoder_input_ids=torch.tensor([[0]]))
+                outputs = self.pretrained_model(input_ids=tokens['input_ids'].to(device), attention_mask=tokens['attention_mask'].to(device), decoder_input_ids=decoder_input_ids)
 
-            # Assuming the model outputs logits or probabilities
-            logits = outputs.logits
 
-            # Convert logits to probabilities
-            probs = torch.softmax(logits, dim=-1)
+            logits_list = [outputs.logits[0][0][tokenizer(i)['input_ids'][0]] for i in matches]
+            logits = torch.tensor(logits_list)
 
-            # Find the index of the highest probability which corresponds to the answer
-            pred_idx = torch.argmax(probs, dim=-1)
+            probs = torch.nn.functional.softmax(logits)
+            print(probs)
+            # Create a dictionary to map indices to letters dynamically
+            index_to_letter = {index: letter for index, letter in enumerate(matches)}
 
-            print(pred_idx)
-            print(tokenizer.decode(pred_idx[0]))
+            # Get the predicted letter
+            pred = index_to_letter[torch.argmax(probs).item()]
 
-            # Assuming the answers are mapped to labels like 0:'A', 1:'B', 2:'C', 3:'D', ...
-            pred_letter = tokenizer.decode(pred_idx[0])
+            output_dict["preds"].append(pred)
 
-            # Append the predicted letter to the output dictionary
-            output_dict["preds"].append(pred_letter)
+        torch.cuda.empty_cache()
 
         ########################################################################
 
