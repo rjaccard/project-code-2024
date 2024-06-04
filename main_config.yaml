@@ -8,10 +8,7 @@
 "test_data_path": "./datasets/mcqa_example.jsonl" # Your path to the test data
 "dpo_model_args": null # Put any model arguments required to load your DPO model below
 "rag_model_args": # Put any model arguments required to load your rag model below
-  "rag_name_or_path": "facebook/rag-token-nq"
-  "generator_name_or_path": "google/flan-t5-small"    # Should be path to our pre-trained model
-  "question_encoder_name_or_path" : "facebook/dpr-question_encoder-single-nq-base"
-  "dataset_path" : "datasets/rag/rag_dataset"
-  "index_path" : "datasets/rag/rag_dataset_index.faiss"
-  "rag_save_dir" : "checkpoints/rag_model/"
+  "path_rag": "jaffolte/rag_mcqa"
+  "path_dataset" : "datasets/rag/rag_dataset"
+  "path_index" : "datasets/rag/rag_dataset_index.faiss"
 "quantized_model_args": null # Put any model arguments required to load your quantized model below
