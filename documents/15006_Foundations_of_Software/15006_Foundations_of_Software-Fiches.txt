@@ -1,0 +1,3489 @@
+
+Writing a parser with parser combinators
+----------------------------------------
+
+In Scala, you can (ab)use the operator overload to create an embedded DSL (EDSL) for grammars. While a grammar may look as follows in a grammar description language (Bison, Yak, ANTLR, …):
+
+```
+    Expr ::= Term {'+' Term | '−' Term}
+    Term ::= Factor {'∗' Factor | '/' Factor}
+    Factor ::= Number | '(' Expr ')'
+```
+
+In Scala, we can model it as follows:
+
+```
+    def expr: Parser[Any] = term ~ rep("+" ~ term | "−" ~ term)
+    def term: Parser[Any] = factor ~ rep("∗" ~ factor | "/" ~ factor)
+    def factor: Parser[Any] = "(" ~ expr ~ ")" | numericLit
+```
+    
+
+This is perhaps a little less elegant, but allows us to encode it directly into our language, which is often useful for interop.
+
+The `~`, `|`, `rep` and `opt` are **parser combinators**. These are primitives with which we can construct a full parser for the grammar of our choice.
+
+### Boilerplate
+
+First, let’s define a class `ParseResult[T]` as an ad-hoc monad; parsing can either succeed or fail:
+
+```
+    sealed trait ParseResult[T]
+    case class Success[T](result: T, in: Input) extends ParseResult[T]
+    case class Failure(msg : String, in: Input) extends ParseResult[Nothing]
+```
+    
+> 👉 `Nothing` is the bottom type in Scala; it contains no members, and nothing can extend it
+
+Let’s also define the tokens produced by the lexer (which we won’t define) as case classes extending `Token`:
+
+```
+    sealed trait Token
+    case class Keyword(chars: String) extends Token
+    case class NumericLit(chars: String) extends Token
+    case class StringLit(chars: String) extends Token
+    case class Identifier(chars: String) extends Token
+```
+    
+
+Input into the parser is then a lazy stream of tokens (with positions for error diagnostics, which we’ll omit here):
+
+```
+    type Input = Reader[Token]
+```
+    
+
+We can then define a standard, sample parser which looks as follows on the type-level:
+
+    
+``` 
+    class StandardTokenParsers {
+        type Parser = Input => ParseResult
+    }
+```
+    
+
+### The basic idea
+
+For each language (defined by a grammar symbol `S`), define a function `f` that, given an input stream `i` (with tail `i'`):
+
+*   if a prefix of `i` is in `S`, return `Success(Pair(x, i'))`, where `x` is a result for `S`
+*   otherwise, return `Failure(msg, i)`, where `msg` is an error message string
+
+The first is called _success_, the second is _failure_. We can compose operations on this somewhat conveniently, like we would on a monad (like `Option`).
+
+### Simple parser primitives
+
+All of the above boilerplate allows us to define a parser, which succeeds if the first token in the input satisfies some given predicate `pred`. When it succeeds, it reads the token string, and splits the input there.
+
+    
+```    
+    def token(kind: String)(pred: Token => boolean) = new Parser[String] {
+        def apply(in : Input) =
+            if (pred(in.head)) Success(in.head.chars, in.tail)
+            else Failure(kind + " expected ", in)
+    }
+```
+
+We can use this to define a keyword parser:
+
+```
+    implicit def keyword(chars: String) = token("'" + chars + "'") {
+        case Keyword(chars1) => chars == chars1
+        case _ => false
+    }
+```    
+
+Marking it as `implicit` allows us to write keywords as normal strings, where we can omit the `keyword` call (this helps us simplify the notation in our DSL; we can write `"if"` instead of `keyword("if")`).
+
+We can make other parsers for our other case classes quite simply:
+
+    
+```
+    def numericLit = token("number")(_.isInstanceOf[NumericLit])
+    def stringLit = token("string literal")(_.isInstanceOf[StringLit])
+    def ident = token("identifier")(_.isInstanceOf[Identifier])
+```
+    
+
+### Parser combinators
+
+We are going to define the following parser combinators:
+
+*   `~`: sequential composition
+*   `<~`, `>~`: sequential composition, keeping left / right only
+*   `|`: alternative
+*   `opt(X)`: option (like a `?` quantifier in a regex)
+*   `rep(X)`: repetition (like a `*` quantifier in a regex)
+*   `repsep(P, Q)`: interleaved repetition
+*   `^^`: result conversion (like a `map` on an `Option`)
+*   `^^^`: constant result (like a `map` on an `Option`, but returning a constant value regardless of result)
+
+But first, we’ll write some very basic parser combinators: `success` and `failure`, that respectively always succeed and always fail:
+
+    
+```
+    def success[T](result: T) = new Parser[T] {
+        def apply(in: Input) = Success(result, in)
+    }
+    
+    def failure(msg: String) = new Parser[Nothing] {
+        def apply(in: Input) = Failure(msg, in)
+    }
+```
+    
+
+All of the above are methods on a `Parser[T]` class. Thanks to infix space notation in Scala, we can denote `x.y(z)` as `x y z`, which allows us to simplify our DSL notation; for instance `A ~ B` corresponds to `A.~(B)`.
+
+    
+```
+    abstract class Parser[T] {
+        // An abstract method that defines the parser function
+        def apply(in : Input): ParseResult
+    
+        def ~[U](rhs: Parser[U]) = new Parser[T ~ U] {
+            def apply(in: Input) = Parser.this(in) match {
+                case Success(x, tail) => rhs(tail) match {
+                    case Success(y, rest) => Success(new ~(x, y), rest)
+                    case failure => failure
+                }
+                case failure => failure
+            }
+        }
+    
+        def |(rhs: => Parser[T]) = new Parser[T] {
+            def apply(in : Input) = Parser.this(in) match {
+                case s1 @ Success(_, _) => s1
+                case failure => rhs(in)
+            }
+        }
+    
+        def ^^[U](f: T => U) = new Parser[U] {
+            def apply(in : Input) = Parser.this(in) match {
+                case Success(x, tail) => Success(f(x), tail)
+                case x => x
+            }
+        }
+    
+        def ^^^[U](r: U): Parser[U] = ^^(x => r)
+    }
+    
+```
+
+> 👉 In Scala, `T ~ U` is syntactic sugar for `~[T, U]`, which is the type of the case class we’ll define below
+
+For the `~` combinator, when everything works, we’re using `~`, a case class that is equivalent to `Pair`, but prints the way we want to and allows for the concise type-level notation above.
+
+```
+    case class ~[T, U](_1 : T, _2 : U) {
+        override def toString = "(" + _1 + " ~ " + _2 +")"
+    }
+```
+    
+
+At this point, we thus have **two** different meanings for `~`: a _function_ `~` that produces a `Parser`, and the `~(a, b)` _case class_ pair that this parser returns (all of this is encoded in the function signature of the `~` function).
+
+Note that the `|` combinator takes the right-hand side parser as a call-by-name argument. This is because we don’t want to evaluate it unless it is strictly needed—that is, if the left-hand side fails.
+
+`^^` is like a `map` operation on `Option`; `P ^^ f` succeeds iff `P` succeeds, in which case it applies the transformation `f` on the result of P. Otherwise, it fails.
+
+### Shorthands
+
+We can now define shorthands for common combinations of parser combinators:
+
+    
+```
+    def opt[T](p : Parser[T]): Parser[Option[T]] = p ^^ Some | success(None)
+    
+    def rep[T](p : Parser[T]): Parser[List[T]] = 
+        p ~ rep(p) ^^ { case x ~ xs => x :: xs } | success(Nil)
+    
+    def repsep[T, U](p : Parser[T], q : Parser[U]): Parser[List[T]] = 
+        p ~ rep(q ~> p) ^^ { case r ~ rs => r :: rs } | success(Nil)
+```
+    
+
+Note that none of the above can fail. They may, however, return `None` or `Nil` wrapped in `success`.
+
+As an exercise, we can implement the `rep1(P)` parser combinator, which corresponds to the `+` regex quantifier:
+
+    
+```    
+    def rep1[T](p: Parser[T]) = p ~ rep(p)
+```
+    
+
+### Example: JSON parser
+
+Let’s define a JSON parser. Scala’s parser combinator library has a `StandardTokenParsers` that give us a variety of utility methods for lexing, like `lexical.delimiters`, `lexical.reserved`, `stringLit` and `numericLit`.
+
+    
+```
+    object JSON extends StandardTokenParsers {
+        lexical.delimiters += ("{", "}", "[", "]", ":")
+        lexical.reserved += ("null", "true", "false")
+    
+        // Return Map
+        def obj: Parser[Any] = "{" ~ repsep(member, ",") ~ "}" ^^ (ms => Map() ++ ms)
+    
+        // Return List
+        def arr: Parser[Any] = "[" ~> repsep(value, ",") <~ "]"
+    
+        // Return name/value pair:
+        def member: Parser[Any] = stringLit ~ ":" ~ value ^^ {
+            case name ~ ":" ~ value => (name, value) 
+        }
+    
+        // Return correct Scala type
+        def value: Parser[Any] =
+              obj 
+            | arr 
+            | stringLit
+            | numericLit ^^ (_.toInt)
+            | "null" ^^^ null
+            | "true" ^^^ true
+            | "false" ^^^ false
+    }
+```
+
+### The trouble with left-recursion
+
+Parser combinators work top-down and therefore do not allow for left-recursion. For example, the following would go into an infinite loop, where the parser keeps recursively matching the same token unto `expr`:
+
+    
+```
+    def expr = expr ~ "-" ~ term
+```
+    
+
+Let’s take a look at an arithmetic expression parser:
+
+    
+``` 
+    object Arithmetic extends StandardTokenParsers {
+        lexical.delimiters ++= List("(", ")", "+", "−", "∗", "/")
+        def expr: Parser[Any] = term ~ rep("+" ~ term | "−" ~ term)
+        def term: Parser[Any] = factor ~ rep("∗" ~ factor | "/" ~ factor)
+        def factor: Parser[Any] = "(" ~ expr ~ ")" | numericLit
+    }
+```
+
+This definition of `expr`, namely `term ~ rep("-" ~ term)` produces a right-leaning tree. For instance, `1 - 2 - 3` produces `1 ~ List("-" ~ 2, ~ "-" ~ 3)`.
+
+The solution is to combine calls to `rep` with a final foldLeft on the list:
+
+    
+```   
+    object Arithmetic extends StandardTokenParsers {
+        lexical.delimiters ++= List("(", ")", "+", "−", "∗", "/")
+        def expr: Parser[Any] = term ~ rep("+" ~ term | "−" ~ term) ^^ reduceList
+        def term: Parser[Any] = factor ~ rep("∗" ~ factor | "/" ~ factor) ^^ reduceList
+        def factor: Parser[Any] = "(" ~ expr ~ ")" | numericLit
+    
+        private def reduceList(list: Expr ~ List[String ~ Expr]): Expr = list match {
+            case x ~ xs => (x foldLeft ps)(reduce)
+        }
+    
+        private def reduce(x: Int, r: String ~ Int) = r match {
+            case "+" ~ y => x + y
+            case "−" ~ y => x − y
+            case "∗" ~ y => x ∗ y
+            case "/" ~ y => x / y
+            case => throw new MatchError("illegal case: " + r)
+        }
+    }
+```
+  
+
+> 👉 It used to be that the standard library contained parser combinators, but those are now a [separate module](https://github.com/scala/scala-parser-combinators). This module contains a `chainl` (chain-left) method that reduces after a `rep` for you.
+
+Arithmetic expressions — abstract syntax and proof principles
+-------------------------------------------------------------
+
+This section follows Chapter 3 in TAPL.
+
+### Basics of induction
+
+Ordinary induction is simply:
+
+    Suppose P is a predicate on natural numbers.
+    Then:
+        If P(0)
+        and, for all i, P(i) implies P(i + 1)
+        then P(n) holds for all n
+    
+
+We can also do complete induction:
+
+    Suppose P is a predicate on natural numbers.
+    Then:
+        If for each natural number n,
+        given P(i) for all i < n we can show P(n)
+        then P(n) holds for all n
+    
+
+It proves exactly the same thing as ordinary induction, it is simply a restated version. They’re _interderivable_; assuming one, we can prove the other. Which one to use is simply a matter of style or convenience. We’ll see some more equivalent styles as we go along.
+
+### Mathematical representation of syntax
+
+Let’s assume the following grammar:
+
+    
+```
+    t ::= 
+        true
+        false
+        if t then t else t
+        0
+        succ t
+        pred t
+        iszero t
+```   
+
+What does this really define? A few suggestions:
+
+*   A set of character strings
+*   A set of token lists
+*   A set of abstract syntax trees
+
+It depends on how you read it; a grammar like the one above contains information about all three.
+
+However, we are mostly interested in the ASTs. The above grammar is therefore called an **abstract grammar**. Its main purpose is to suggest a mapping from character strings to trees.
+
+For our use of these, we won’t be too strict with these. For instance, we’ll freely use parentheses to disambiguate what tree we mean to describe, even though they’re not strictly supported by the grammar. What matters to us here aren’t strict implementation semantics, but rather that we have a framework to talk about ASTs. For our purposes, we’ll consider that two terms producing the same AST are basically the same; still, we’ll distinguish terms that only have the same evaluation result, as they don’t necessarily have the same AST.
+
+How can we express our grammar as mathematical expressions? A grammar describes the legal _set_ of terms in a program by offering a recursive definition. While recursive definitions may seem obvious and simple to a programmer, we have to go through a few hoops to make sense of them mathematically.
+
+#### Mathematical representation 1
+
+We can use a set T of terms. The grammar is then the smallest set such that:
+
+1.  {true,false,0}⊆T,
+2.  If t1∈T then {succ t1,pred t1,iszero t1}⊆T,
+3.  If t1,t2,t3∈T then we also have if t1 then t2 else t3∈T.
+
+#### Mathematical representation 2
+
+We can also write this somewhat more graphically:
+
+true ∈T,false ∈T,0∈T
+
+\frac{t1∈T}{succ t1∈T}, \frac{t1∈T}{pred t1∈T},\frac{t1∈T}{iszero t1∈T}
+\frac{t1∈T,t2∈T,t3∈T}{if t1 then t2 else t3∈T}
+
+This is exactly equivalent to representation 1, but we have just introduced a different notation. Note that “the smallest set closed under…” is often not stated explicitly, but implied.
+
+#### Mathematical representation 3
+
+Alternatively, we can build up our set of terms as an infinite union:
+
+S0\=∅
+S_{i+1}\={true, false,0}∪{succ t1,pred t1,iszero t1∣t1∈Si}∪{if t1 then t2 else t3∣t1,t2,t3∈Si}
+
+We can thus build our final set as follows:
+
+S\=⋃_i S_i
+
+Note that we can “pull out” the definition into a generating function F:
+
+S_0\=∅
+S_{i+1}\=F(S_i)
+S\=⋃_i S_i
+
+The generating function is thus defined as:
+
+F1(U)\={true}
+F2(U)\={false}
+F3(U)\={0}
+F4(U)\={succ t1∣t1∈U}
+F5(U)\={pred t1∣t1∈U}
+F6(U)\={iszero t1∣t1∈U}
+F7(U)\={if t1 then t2 else t3∣t1,t2,t3∈U}
+F(U)\=⋃_{i\=1}^7 F_i(U)
+
+Each function takes a set of terms U as input and produces “terms justified by U” as output; that is, all terms that have the items of U as subterms.
+
+The set U is said to be **closed under F** or **F-closed** if F(U)⊆U.
+
+The set of terms T as defined above is the smallest F-closed set. If O is another F-closed set, then T⊆O.
+
+#### Comparison of the representations
+
+We’ve seen essentially two ways of defining the set (as representation 1 and 2 are equivalent, but with different notation):
+
+1.  The smallest set that is closed under certain rules. This is compact and easy to read.
+2.  The limit of a series of sets. This gives us an _induction principle_ on which we can prove things on terms by induction.
+
+The first one defines the set “from above”, by intersecting F-closed sets.
+
+The second one defines it “from below”, by starting with ∅ and getting closer and closer to being F-closed.
+
+These are equivalent (we won’t prove it, but Proposition 3.2.6 in TAPL does so), but can serve different uses in practice.
+
+### Induction on terms
+
+First, let’s define depth: the **depth** of a term t is the smallest i such that t∈Si.
+
+The way we defined Si, it gets larger and larger for increasing i; the depth of a term t gives us the step at which t is introduced into the set.
+
+We see that if a term t is in Si, then all of its immediate subterms must be in Si−1, meaning that they must have smaller depth.
+
+This justifies the principle of **induction on terms**, or **structural induction**. Let P be a predicate on a term:
+
+```
+    If, for each term s,
+        given P(r) for all immediate subterms r of s we can show P(s)
+        then P(t) holds for all t
+```
+
+All this says is that if we can prove the induction step from subterms to terms (under the induction hypothesis), then we have proven the induction.
+
+We can also express this structural induction using generating functions, which we [introduced previously](https://kjaer.io/fos/#mathematical-representation-3).
+
+```
+    Suppose T is the smallest F-closed set.
+    If, for each set U,
+        from the assumption "P(u) holds for every u ∈ U",
+        we can show that "P(v) holds for every v ∈ F(U)"
+    then
+        P(t) holds for all t ∈ T
+```
+
+Why can we use this?
+
+*   We assumed that T was the smallest F-closed set, which means that T⊆O for any other F-closed set O.
+*   Showing the pre-condition (“for each set U, from the assumption…”) amounts to showing that the set of all terms satisfying P (call it O) is itself an F-closed set.
+*   Since T⊆O, every element of T satisfies P.
+
+### Inductive function definitions
+
+An [inductive definition](https://en.wikipedia.org/wiki/Recursive_definition) is used to define the elements in a set recursively, as we have done above. The [recursion theorem](https://en.wikipedia.org/wiki/Recursion#The_recursion_theorem) states that a well-formed inductive definition defines a function. To understand what being well-formed means, let’s take a look at some examples.
+
+Let’s define our grammar function a little more formally. Constants are the basic values that can’t be expanded further; in our example, they are `true`, `false`, `0`. As such, the set of constants appearing in a term t, written Consts(t), is defined recursively as follows:
+
+Consts(true)\={true}
+Consts(false)\={false}
+Consts(0)\={0}
+Consts(succ t1)\=Consts(t1)
+Consts(pred t1)\=Consts(t1)
+Consts(iszero t1)\=Consts(t1)
+Consts(if t1 then t2 else t3\=Consts(t1)∪Consts(t2)∪Consts(t3)
+
+This seems simple, but these semantics aren’t perfect. First off, a mathematical definition simply assigns a convenient name to some previously known thing. But here, we’re defining the thing in terms of itself, recursively. And the semantics above also allow us to define ill-formed inductive definitions:
+
+BadConsts(true)\={true}
+BadConsts(false)\={false}
+BadConsts(0)\={0}
+BadConsts(0)\={}\=∅
+BadConsts(succ t1)\=BadConsts(t1)
+BadConsts(pred t1)\=BadConsts(t1)
+BadConsts(iszero t1)\=BadConsts(iszero iszero t1)
+
+The last rule produces infinitely large rules (if we implemented it, we’d expect some kind of stack overflow). We’re missing the rules for if-statements, and we have a useless rule for `0`, producing empty sets.
+
+How do we tell the difference between a well-formed inductive definition, and an ill-formed one as above? What is well-formedness anyway?
+
+#### What is a function?
+
+A relation over T,U is a subset of T×U, where the Cartesian product is defined as:
+
+$T×U\={(t,u):t∈T,u∈U}$
+
+A function f from A (domain) to B (co-domain) can be viewed as a two-place relation, albeit with two additional properties:
+
+*   It is **total**: ∀a∈A,∃b∈B:(a,b)∈f
+*   It is **deterministic**: (a,b1)∈f,(a,b2)∈f⟹b1\=b2
+
+Totality ensures that the A domain is covered, while being deterministic just means that the function always produces the same result for a given input.
+
+#### Induction example 1
+
+As previously stated, Consts is a _relation_. It maps terms (A) into the set of constants that they contain (B). The induction theorem states that it is also a _function_. The proof is as follows.
+
+Consts is total and deterministic: for each term t there is exactly one set of terms C such that (t,C)∈Consts[1](https://kjaer.io/fos/#fn:in-relation-notation) . The proof is done by induction on t.
+
+To be able to apply the induction principle for terms, we must first show that for an arbitrary term t, under the following induction hypothesis:
+
+> For each immediate subterm s of t, there is exactly one set of terms Cs such that (s,Cs)∈Consts
+
+Then the following needs to be proven as an induction step:
+
+> There is **exactly one** set of terms C such that (t,C)∈Consts
+
+We proceed by cases on t:
+
+*   If t is 0, true or false
+    
+    We can immediately see from the definition that of Consts that there is exactly one set of terms C\={t}) such that (t,C)∈Consts.
+    
+    This constitutes our base case.
+    
+*   If t is succ t1, pred t1 or iszero t1
+    
+    The immediate subterm of t is t1, and the induction hypothesis tells us that there is exactly one set of terms C1 such that (t1,C1)∈Consts. But then it is clear from the definition that there is exactly one set of terms C\=C1 such that (t,C)∈Consts.
+    
+*   If t is if t1 then t2 else t3
+    
+    The induction hypothesis tells us:
+    
+    *   There is exactly one set of terms C1 such that (t1,C1)∈Consts
+    *   There is exactly one set of terms C2 such that (t2,C2)∈Consts
+    *   There is exactly one set of terms C3 such that (t3,C3)∈Consts
+    
+    It is clear from the definition of Consts that there is exactly one set C\=C1∪C2∪C3 such that (t,C)∈Consts.
+    
+
+This proves that Consts is indeed a function.
+
+But what about BadConsts? It is also a relation, but it isn’t a function. For instance, we have BadConsts(0)\={0} and BadConsts(0)\=∅, which violates determinism. To reformulate this in terms of the above, there are two sets C such that (0,C)∈BadConsts, namely C\={0} and C\=∅.
+
+Note that there are many other problems with BadConsts, but this is sufficient to prove that it isn’t a function.
+
+#### Induction example 2
+
+Let’s introduce another inductive definition:
+
+size(true)\=1
+size(false)\=1
+size(0)\=1
+size(succ t1)\=size(t1)+1
+size(pred t1)\=size(t1)+1
+size(iszero t1)\=size(t1)+1
+size(if t1 then t2 else t3)\=size(t1)+size(t2)+size(t3)
+
+We’d like to prove that the number of distinct constants in a term is at most the size of the term. In other words, that |Consts(t)|≤size(t)
+
+The proof is by induction on t:
+
+*   t is a constant; t\=true, t\=false or t\=0
+    
+    The proof is immediate. For constants, the number of constants and the size are both one: |Consts(t)|\=|{t}|\=1\=size(t)
+    
+*   t is a function; t\=succ t1, t\=pred t1 or t\=iszero t1
+    
+    By the induction hypothesis, |Consts(t1)|≤size(t1).
+    
+    We can then prove the proposition as follows: |Consts(t)|\=|Consts(t1)|≤size(t1)\=size(t)+1<size(t)
+    
+*   t is an if-statement: t\=if t1 then t2 else t3
+    
+    By the induction hypothesis, |Consts(t1)|≤size(t1), |Consts(t2)|≤size(t2) and |Consts(t3)|≤size(t3).
+    
+    We can then prove the proposition as follows:
+
+|Consts|\=|Consts(t1)∪Consts(t2)∪Consts(t3)|≤|Consts(t1)|+|Consts(t2)|+|Consts(t3)|≤size(t1)+size(t2)+size(t3)<size(t)
+
+### Operational semantics and reasoning
+
+#### Evaluation
+
+Suppose we have the following syntax
+
+```   
+    t ::=                  // terms
+        true                   // constant true
+        false                  // constant false 
+        if t then t else t     // conditional
+```   
+
+The evaluation relation t⟶t′ is the smallest relation closed under the following rules.
+
+The following are _computation rules_, defining the “real” computation steps:
+
+if true then t2 else t3⟶t2	(E-IfTrue)
+if false then t2 else t3⟶t3	(E-IfFalse)
+
+The following is a _congruence rule_, defining where the computation rule is applied next:
+
+\frac{t1⟶t′1}{if t1 then t2 else t3⟶if t′1 then t2 else t3}	(E-If)
+
+We want to evaluate the condition before the conditional clauses in order to save on evaluation; we’re not sure which one should be evaluated, so we need to know the condition first.
+
+#### Derivations
+
+We can describe the evaluation logically from the above rules using derivation trees. Suppose we want to evaluate the following (with parentheses added for clarity): `if (if true then true else false) then false else true`.
+
+In an attempt to make all this fit onto the screen, `true` and `false` have been abbreviated `T` and `F` in the derivation below, and the `then` keyword has been replaced with a parenthesis notation for the condition.
+
+\frac{\frac{if (T) T else F⟶T (E-IfTrue)}{if (if (T) T else F) F else T⟶if (T) F else T	(E-If)} if (T) F else T⟶F	(E-IfTrue)}{if (if (T) T else F) F else T⟶T}
+
+The final statement is a **conclusion**. We say that the derivation is a **witness** for its conclusion (or a **proof** for its conclusion). The derivation records all reasoning steps that lead us to the conclusion.
+
+#### Inversion lemma
+
+We can introduce the **inversion lemma**, which tells us how we got to a term.
+
+Suppose we are given a derivation D witnessing the pair (t,t′) in the evaluation relation. Then either:
+
+1.  If the final rule applied in D was ([E-IfTrue](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-iftrue)), then we have if true then t2 else t3 and t′\=t2 for some t2 and t3
+2.  If the final rule applied in D was ([E-IfFalse](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-iffalse)), then we have if false then t2 else t3 and t′\=t2 for some t2 and t3
+3.  If the final rule applied in D was ([E-If](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-if)), then we have t\=if t1 then t2 else t3 and t′\=t\=if t′1 then t2 else t3, for some t1,t′1,t2,t3. Moreover, the immediate subderivation of D witnesses (t1,t′1)∈⟶.
+
+This is super boring, but we do need to acknowledge the inversion lemma before we can do induction proofs on derivations. Thanks to the inversion lemma, given an arbitrary derivation D with conclusion t⟶t′, we can proceed with a case-by-case analysis on the final rule used in the derivation tree.
+
+Let’s recall our [definition of the size function](https://kjaer.io/fos/#induction-example-2). In particular, we’ll need the rule for if-statements:
+
+size(if t1 then t2 else t3)\=size(t1)+size(t2)+size(t3)
+
+We want to prove that if t⟶t′, then size(t)\>size(t′).
+
+1.  If the final rule applied in D was ([E-IfTrue](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-iftrue)), then we have t\=if true then t2 else t3 and t′\=t2, and the result is immediate from the definition of size
+2.  If the final rule applied in D was ([E-IfFalse](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-iffalse)), then we have t\=if false then t2 else t3 and t′\=t2, and the result is immediate from the definition of size
+3.  If the final rule applied in D was ([E-If](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-if)), then we have t\=if t1 then t2 else t3 and t′\=if t′1 then t2 else t3. In this case, t1⟶t′1 is witnessed by a derivation D1. By the induction hypothesis, size(t1)\>size(t′1), and the result is then immediate from the definition of size
+
+### Abstract machines
+
+An abstract machine consists of:
+
+*   A set of **states**
+*   A **transition** relation of states, written ⟶
+
+t⟶t′ means that t evaluates to t′ in one step. Note that ⟶ is a relation, and that t⟶t′ is shorthand for (t,t′)∈⟶. Often, this relation is a partial function (not necessarily covering the domain A; there is at most one possible next state). But without loss of generality, there may be many possible next states, determinism isn’t a criterion here.
+
+### Normal forms
+
+A normal form is a term that cannot be evaluated any further. More formally, a term t is a normal form if there is no t′ such that t⟶t′. A normal form is a state where the abstract machine is halted; we can regard it as the result of a computation.
+
+#### Values that are normal form
+
+Previously, we intended for our values (true and false) to be exactly that, the result of a computation. Did we get that right?
+
+Let’s prove that a term t is a value ⟺ it is in normal form.
+
+*   The ⟹ direction is immediate from the definition of the evaluation relation ⟶.
+*   The ⟸ direction is more conveniently proven as its contrapositive: if t is not a value, then it is not a normal form, which we can prove by induction on the term t.
+    
+    Since t is not a value, it must be of the form if t1 then t2 else t3. If t1 is directly `true` or `false`, then [E-IfTrue](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-iftrue) or [E-IfFalse](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-iffalse) apply, and we are done.
+    
+    Otherwise, if t\=if t1 then t2 else t3 where t1 isn’t a value, by the induction hypothesis, there is a t′1 such that t1⟶t′1. Then rule [E-If](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-if) yields if t′1 then t2 else t3, which proves that t is not in normal form.
+    
+
+#### Values that are not normal form
+
+Let’s introduce new syntactic forms, with new evaluation rules.
+
+    
+```
+    t ::=        // terms
+        0            // constant 0
+        succ t       // successor
+        pred t       // predecessor 
+        iszero t     // zero test
+    
+    v ::=  nv     // values
+    
+    nv ::=        // numeric values
+        0             // zero value
+        succ nv       // successor value
+```    
+
+The evaluation rules are given as follows:
+
+\frac{t1⟶t′1}{succ t1⟶succ t′1}	(E-Succ)
+pred 0⟶0	(E-PredZero)
+pred succ nv1⟶nv1	(E-PredSucc)
+\frac{t1⟶t′1}{pred t1⟶pred t′1}	(E-Pred)
+iszero 0⟶trueis	(E-IszeroZero)
+zero succ nv1⟶false	(E-IszeroSucc)
+\frac{t1⟶t′1}{iszero t1⟶iszero t′1} 	(E-Iszero)
+
+All values are still normal forms. But are all normal forms values? Not in this case. For instance, `succ true`, `iszero true`, etc, are normal forms. These are **stuck terms**: they are in normal form, but are not values. In general, these correspond to some kind of type error, and one of the main purposes of a type system is to rule these kinds of situations out.
+
+### Multi-step evaluation
+
+Let’s introduce the _multi-step evaluation_ relation, ⟶∗. It is the reflexive, transitive closure of single-step evaluation, i.e. the smallest relation closed under these rules:
+
+\frac{t⟶t′}{t⟶∗t′}
+t⟶∗t	(Reflexivity)
+\frac{t⟶∗t′	t′⟶∗t′′}{t⟶∗t′′}	(Transitivity)
+
+In other words, it corresponds to any number of single consecutive evaluations.
+
+### Termination of evaluation
+
+We’ll prove that evaluation terminates, i.e. that for every term t there is some normal form t′ such that t⟶∗t′.
+
+First, let’s [recall our proof](https://kjaer.io/fos/#induction-example-2) that t⟶t′⟹size(t)\>size(t′). Now, for our proof by contradiction, assume that we have an infinite-length sequence t0,t1,t2,… such that:
+
+t0⟶t1⟶t2⟶…⟹size(t0)\>size(t1)\>size(t2)\>…
+
+But this sequence cannot exist: since size(t0) is a finite, natural number, we cannot construct this infinite descending chain from it. This is a contradiction.
+
+Most termination proofs have the same basic form. We want to prove that the relation R⊆X×X is terminating — that is, there are no infinite sequences x0,x1,x2,… such that (xi,xi+1)∈R for each i. We proceed as follows:
+
+1.  Choose a well-suited set W with partial order < such that there are no infinite descending chains w0\>w1\>w2\>… in W. Also choose a function f:X→W.
+2.  Show f(x)\>f(y)∀(x,y)∈R
+3.  Conclude that are no infinite sequences (x0,x1,x2,…) such that (xi,xi+1)∈R for each i. If there were, we could construct an infinite descending chain in W.
+
+As a side-note, **partial order** is defined as the following properties:
+
+1.  **Anti-symmetry**: ¬(x<y∧y<x)
+2.  **Transitivity**: x<y∧y<z⟹x<z
+
+We can add a third property to achieve **total order**, namely x≠y⟹x<y∨y<x.
+
+Lambda calculus
+---------------
+
+Lambda calculus is Turing complete, and is higher-order (functions are data). In lambda calculus, all computation happens by means of function abstraction and application.
+
+Lambda calculus is isomorphic to Turing machines.
+
+Suppose we wanted to write a function `plus3` in our previous language:
+
+```
+    plus3 x = succ succ succ x
+```
+
+The way we write this in lambda calculus is:
+
+plus3 \=λx. succ(succ(succ(x)))
+
+λx.t is written `x => t` in Scala, or `fun x -> t` in OCaml. Application of our function, say `plus3(succ 0)`, can be written as:
+
+(λx.succ succ succ x)(succ 0)
+
+Abstraction over functions is possible using higher-order functions, which we call λ\-abstractions. An example of such an abstraction is the function g below, which takes an argument f and uses it in the function position.
+
+g\=λf.f(f(succ 0))
+
+If we apply g to an argument like plus3, we can just use the substitution rule to see how that defines a new function.
+
+Another example: the `twice` function below takes two arguments, as a curried function would. First, it takes the function to apply twice, then the argument on which to apply it, and then returns f(f(y)).
+
+twice\=λf.λy.f(f(y))
+
+### Pure lambda calculus
+
+Once we have λ\-abstractions, we can actually throw out all other language primitives like booleans and other values; all of these can be expressed as functions, as we’ll see below. In pure lambda-calculus, _everything_ is a function.
+
+Variables will always denote a function, functions always take other functions as parameters, and the result of an evaluation is always a function.
+
+The syntax of lambda-calculus is very simple:
+
+    
+```
+    t ::=      // terms, also called λ-terms
+        x         // variable
+        λx. t     // abstraction, also called λ-abstractions
+        t t       // application
+```
+    
+
+A few rules and syntactic conventions:
+
+*   Application associates to the left, so t u v means (t u) v, not t (u v).
+*   Bodies of lambda abstractions extend as far to the right as possible, so λx.λy. x y means λx. (λy.x y), not λx. (λy. x) y
+
+#### Scope
+
+The lambda expression λx. t **binds** the variable x, with a **scope** limited to t. Occurrences of x inside of t are said to be _bound_, while occurrences outside are said to be _free_.
+
+Let fv(t) be the set of free variables in a term t. It’s defined as follows:
+
+fv(x)\={x}
+fv(λx. t1)\=fv(t1)∖{x}
+fv(t1 t2)\=fv(t1)∪fv(t2)
+
+#### Operational semantics
+
+As we saw with our previous language, the rules could be distinguished into _computation_ and _congruence_ rules. For lambda calculus, the only computation rule is:
+
+(λx.t12) v2⟶\[x↦v2\]t12	(E-AppAbs)
+
+The notation \[x↦v2\]t12 means “the term that results from substituting free occurrences of x in t12 with v2”.
+
+The congruence rules are:
+
+\frac{t1⟶t′1}{t1 t2⟶t′1 t2}	(E-App1)
+\frac{t2⟶t′2}{t1 t2⟶t1 t′2}	(E-App2)
+
+A lambda-expression applied to a value, (λx. t) v, is called a **reducible expression**, or **redex**.
+
+#### Evaluation strategies
+
+There are alternative evaluation strategies. In the above, we have chosen call by value (which is the standard in most mainstream languages), but we could also choose:
+
+*   **Full beta-reduction**: any redex may be reduced at any time. This offers no restrictions, but in practice, we go with a set of restrictions like the ones below (because coding a fixed way is easier than coding probabilistic behavior).
+*   **Normal order**: the leftmost, outermost redex is always reduced first. This strategy allows to reduce inside unapplied lambda terms
+*   **Call-by-name**: allows no reductions inside lambda abstractions. Arguments are not reduced before being substituted in the body of lambda terms when applied. Haskell uses an optimized version of this, call-by-need (aka lazy evaluation).
+
+### Classical lambda calculus
+
+Classical lambda calculus allows for full beta reduction.
+
+#### Confluence in full beta reduction
+
+The congruence rules allow us to apply in different ways; we can choose between [E-App1](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-app1) and [E-App2](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-app2) every time we reduce an application, and this offers many possible reduction paths.
+
+While the path is non-deterministic, is the result also non-deterministic? This question took a very long time to answer, but after 25 years or so, it was proven that the result is always the same. This is known the **Church-Rosser confluence theorem**:
+
+Let t,t1,t2 be terms such that t⟶∗t1 and t⟶∗t2. Then there exists a term t3 such that t1⟶∗t3 and t2⟶∗t3
+
+#### Alpha conversion
+
+Substitution is actually trickier than it looks! For instance, in the expression λx. (λy. x) y, the first occurrence of y is bound (it refers to a parameter), while the second is free (it does not refer to a parameter). This is comparable to scope in most programming languages, where we should understand that these are two different variables in different scopes, y1 and y2.
+
+The above example had a variable that is both bound and free, which is something that we’ll try to avoid. This is called a hygiene condition.
+
+We can transform a unhygienic expression to a hygienic one by renaming bound variables before performing the substitution. This is known as **alpha conversion**. Alpha conversion is given by the following conversion rule:
+
+\frac{y∉fv(t)}{(λx. t)\=_α (λy. \[x↦y\] t)}(α)
+
+And these equivalence rules (in mathematics, equivalence is defined as symmetry and transitivity):
+
+\frac{t1\=_α t2}{t2\=_α t1}	(α\-Symm)
+\frac{t1\=_α t2	   t2\=_α t3}{t1\=_α t3}  (α\-Trans)
+
+The congruence rules are as usual.
+
+### Programming in lambda-calculus
+
+#### Multiple arguments
+
+The way to handle multiple arguments is by currying: λx. λy. t
+
+#### Booleans
+
+The fundamental, universal operator on booleans is if-then-else, which is what we’ll replicate to model booleans. We’ll denote our booleans as tru and fls to be able to distinguish these pure lambda-calculus abstractions from the true and false values of our previous toy language.
+
+We want `true` to be equivalent to `if (true)`, and `false` to `if (false)`. The terms tru and fls _represent_ boolean values, in that we can use them to test the truth of a boolean value:
+
+tru \=λt. λf. t
+fls \=λt. λf. f
+
+We can consider these as booleans. Equivalently `tru` can be considered as a function performing `(t1, t2) => if (true) t1 else t2`. To understand this, let’s try to apply tru to two arguments:
+
+tru v w \=(λt. (λf. t)) v w ⟶ (λf. v) w ⟶ v
+
+This works equivalently for `fls`.
+
+We can also do inversion, conjunction and disjunction with lambda calculus, which can be read as particular if-else statements:
+
+not \=λb. b fls true
+and \=λb. λc. b c fls
+or \=λb. λc. b tru c
+
+*   `not` is a function that is equivalent to `not(b) = if (b) false else true`.
+*   `and` is equivalent to `and(b, c) = if (b) c else false`
+*   `or` is equivalent to `or(b, c) = if (b) true else c`
+
+#### Pairs
+
+The fundamental operations are construction `pair(a, b)`, and selection `pair._1` and `pair._2`.
+
+pair \=λf. λs. λb. b f s
+fst \=λp. p tru
+snd \=λp. p fls
+
+*   `pair` is equivalent to `pair(f, s) = (b => b f s)`
+*   When `tru` is applied to `pair`, it selects the first element, by definition of the boolean, and that is therefore the definition of `fst`
+*   Equivalently for `fls` applied to `pair`, it selects the second element
+
+#### Numbers
+
+We’ve actually been representing numbers as lambda-calculus numbers all along! Our `succ` function represents what’s more formally called **Church numerals**.
+
+c0\=λs. λz. z
+c1\=λs. λz. s z
+c2\=λs. λz. s s z
+c3\=λs. λz. s s s z
+
+Note that c0’s implementation is the same as that of fls (just with renamed variables).
+
+Every number n is represented by a term cn taking two arguments, which are s and z (for “successor” and “zero”), and applies s to z, n times. Fundamentally, a number is equivalent to the following:
+
+cn\=λf. λx. f … fx
+
+With this in mind, let us implement some functions on numbers.
+
+scc \=λn. λs. λz. s (n s z)
+add \=λs. λz. m s (n s z)mul \=λm. λn. m (add n) c0
+sub \=λm. λn. n pred m
+iszero \=λm. m (λx. fls) tru
+
+*   **Successor** scc: we apply the successor function to n (which has been correctly instantiated with s and z)
+*   **Addition** add: we pass the instantiated n as the zero of m
+*   **Subtraction** sub: we apply pred n times to m
+*   **Multiplication** mul: instead of the successor function, we pass the addition by n function.
+*   **Zero test** iszero: zero has the same implementation as false, so we can lean on that to build an iszero function. An alternative understanding is that we’re building a number, in which we use true for the zero value z. If we have to apply the successor function s once or more, we want to get false, so for the successor function we use a function ignoring its input and returning false if applied.
+
+What about predecessor? This is a little harder, and it’ll take a few steps to get there. The main idea is that we find the predecessor by rebuilding the whole succession up until our number. At every step, we must generate the number and its predecessor: zero is (c0,c0), and all other numbers are (cn−1,cn). Once we’ve reconstructed this pair, we can get the predecessor by taking the first element of the pair.
+
+zz\=pair c0 c0
+ss\=λp. pair (snd p) (scc (snd p))
+prd\=λm. fst (m ss zz)
+
+Sidenote
+
+The story goes that Church was stumped by predecessors for a long time. This solution finally came to him while he was at the barber, and he jumped out half shaven to write it down.
+
+#### Lists
+
+Now what about lists?
+
+nil\=λf. λg. g
+cons\=λx. λxs. (λf. λg. f x xs)
+head\=λxs. (λy. λys. y)
+isEmpty\=λxs. xs (λy. λys. fls)
+
+### Recursion in lambda-calculus
+
+Let’s start by taking a step back. We talked about normal forms and terms for which we terminate; does lambda calculus always terminate? It’s Turing complete, so it must be able to loop infinitely (otherwise, we’d have solved the halting problem!).
+
+The trick to recursion is self-application:
+
+λx. x x
+
+From a type-level perspective, we would cringe at this. This should not be possible in the typed world, but in the untyped world we can do it. We can construct a simple infinite loop in lambda calculus as follows:
+
+Ω\=(λx. x x) (λx. x x)⟶ (λx. x x) (λx. x x)
+
+The expression evaluates to itself in one step; it never reaches a normal form, it loops infinitely, diverges. This is not a stuck term though; evaluation is always possible.
+
+In fact, there are no stuck terms in pure lambda calculus. Every term is either a value or reduces further.
+
+So it turns out that omega isn’t so terribly useful. Let’s try to construct something more practical:
+
+Yf\=(λx. f (x x)) (λx. f (x x))
+
+Now, the divergence is a little more interesting:
+
+Yf\=(λx. f (x x)) (λx. f (x x))⟶f ((λx. f (x x)) (λx. f (x x)))\=f (Yf)⟶…\=f (f (Yf))
+
+This Yf function is known as a **Y combinator**. It still loops infinitely (though note that while it works in classical lambda calculus, it blows up in call-by-name), so let’s try to build something more useful.
+
+To delay the infinite recursion, we could build something like a poison pill:
+
+poisonpill\=λy. omega
+
+It can be passed around (after all, it’s just a value), but evaluating it will cause our program to loop infinitely. This is the core idea we’ll use for defining the **fixed-point combinator** fix (also known as the call-by-value Y combinator), which allows us to do recursion. It’s defined as follows:
+
+fix\=λf. (λx. f (λy. x x y)) (λx. f (λy. x x y))
+
+This looks a little intricate, and we won’t need to fully understand the definition. What’s important is mostly how it is used to define a recursive function. For instance, if we wanted to define a modulo function in our toy language, we’d do it as follows:
+
+    
+```
+    def mod(x, y) = 
+        if (y > x) x
+        else mod(x - y, y)
+```
+    
+
+In lambda calculus, we’d define this as:
+
+mod\=fix (λf. λx. λy. (gt y x) x (f(sub a b) b))
+
+We’ve assumed that a greater-than gt function was available here.
+
+More generally, we can define a recursive function as:
+
+fix (λf. (recursion on f))
+
+### Equivalence of lambda terms
+
+We’ve seen how to define Church numerals and successor. How can we prove that succ cn is equal to cn+1?
+
+The naive approach unfortunately doesn’t work; they do not evaluate to the same value.
+
+scc c2\=(λn. λs. λz. s (n s z)) (λs. λz. s (s z))⟶λs. λz. s ((λs. λz. s (s z)) s z)≠λs. λz. s (s (s z))\=c3
+
+This still seems very close. If we could simplify a little further, we do see how they would be the same.
+
+The intuition behind the Church numeral representation was that a number n is represented as a term that “does something n times to something else”. scc takes a term that “does something n times to something else”, and returns a term that “does something n+1 times to something else”.
+
+What we really care about is that scc c2 _behaves_ the same as c3 when applied to two arguments. We want _behavioral equivalence_. But what does that mean? Roughly, two terms s and t are behaviorally equivalent if there is no “test” that distinguishes s and t.
+
+Let’s define this notion of “test” this a little more precisely, and specify how we’re going to observe the results of a test. We can use the notion of **normalizability** to define a simple notion of a test:
+
+> Two terms s and t are said to be **observationally equivalent** if they are either both normalizable (i.e. they reach a normal form after a finite number of evaluation steps), or both diverge.
+
+In other words, we observe a term’s behavior by running it and seeing if it halts. Note that this is not decidable (by the halting problem).
+
+For instance, omega and tru are not observationally equivalent (one diverges, one halts), while tru and fls are (they both halt).
+
+Observational equivalence isn’t strong enough of a test for what we need; we need behavioral equivalence.
+
+> Two terms s and t are said to be **behaviorally equivalent** if, for every finite sequence of values v1,v2,…,vn the applications s v1 v2 … vn and t v1 v2 … vn are observationally equivalent.
+
+This allows us to assert that true and false are indeed different:
+
+tru x Ω⟶x
+fls x Ω⟶Ω
+
+The former returns a normal form, while the latter diverges.
+
+Types
+-----
+
+As previously, to define a language, we start with a _set of terms_ and _values_, as well as an _evaluation relation_. But now, we’ll also define a set of **types** (denoted with a first capital letter) classifying values according to their “shape”. We can define a _typing relation_ t: T. We must check that the typing relation is _sound_ in the sense that:
+
+\frac{t:T	t⟶∗v}{v:T}
+and
+\frac{t:T}{∃t′ such that t⟶t′}
+
+These rules represent some kind of safety and liveness, but are more commonly referred to as [progress and preservation](https://kjaer.io/fos/#properties-of-the-typing-relation), which we’ll talk about later. The first one states that types are preserved throughout evaluation, while the second says that if we can type-check, then evaluation of t will not get stuck.
+
+In our previous toy language, we can introduce two types, booleans and numbers:
+
+```
+    T ::=     // types
+        Bool     // type of booleans
+        Nat      // type of numbers
+```
+
+Our typing rules are then given by:
+
+true : Bool	 (T-True)
+false : Bool	(T-False)
+0: Nat		(T-Zero)
+\frac{t1:Bool  t2:T  t3:T}{if t1 then t2 else t3}	(T-If)
+\frac{t1:Nat}{succ t1:Nat}	(T-Succ)
+\frac{t1:Nat}{pred t1:Nat}	(T-Pred)
+\frac{t1:Nat}{iszero t1:Nat} 	(T-IsZero)
+
+With these typing rules in place, we can construct typing derivations to justify every pair t:T (which we can also denote as a (t,T) pair) in the typing relation, as we have done previously with evaluation. Proofs of properties about the typing relation often proceed by induction on these typing derivations.
+
+Like other static program analyses, type systems are generally imprecise. They do not always predict exactly what kind of value will be returned, but simply a conservative approximation. For instance, `if true then 0 else false` cannot be typed with the above rules, even though it will certainly evaluate to a number. We could of course add a typing rule for `if true` statements, but there is still a question of how useful this is, and how much complexity it adds to the type system, and especially for proofs. Indeed, the inversion lemma below becomes much more tedious when we have more rules.
+
+### Properties of the Typing Relation
+
+The safety (or soundness) of this type system can be expressed by the following two properties:
+
+*   **Progress**: A well-typed term is not stuck.
+    
+    If t : T then either t is a value, or else t⟶t′ for some t′.
+    
+*   **Preservation**: Types are preserved by one-step evaluation.
+    
+    If t : T and t⟶t′, then t′ : T.
+    
+
+We will prove these later, but first we must state a few lemmas.
+
+#### Inversion lemma
+
+Again, for types we need to state the same (boring) inversion lemma:
+
+1.  If true:R, then R\=Bool.
+2.  If false:R, then R\=Bool.
+3.  If if t1 then t2 else t3:R, then t1: Bool, t2:R and t3:R
+4.  If 0:R then R\=Nat
+5.  If succ t1:R then R\=Nat and t1:Nat
+6.  If pred t1:R then R\=Nat and t1:Nat
+7.  If iszero t1:R then R\=Bool and t1:Nat
+
+From the inversion lemma, we can directly derive a typechecking algorithm:
+
+    
+```
+    def typeof(t: Expr): T = t match {
+        case True | False => Bool
+        case If(t1, t2, t3) =>
+            val type1 = typeof(t1)
+            val type2 = typeof(t2)
+            val type3 = typeof(t3)
+            if (type1 == Bool && type2 == type3) type2
+            else throw Error("not typable")
+        case Zero => Nat
+        case Succ(t1) => 
+            if (typeof(t1) == Nat) Nat
+            else throw Error("not typable")
+        case Pred(t1) => 
+            if (typeof(t1) == Nat) Nat
+            else throw Error("not typable")
+        case IsZero(t1) => 
+            if (typeof(t1) == Nat) Bool
+            else throw Error("not typable")
+    }
+    
+```
+
+#### Canonical form
+
+A simple lemma that will be useful for lemma is that of canonical forms. Given a type, it tells us what kind of values we can expect:
+
+1.  If v is a value of type Bool, then v is either true or false
+2.  If v is a value of type Nat, then v is a numeric value
+
+The proof is somewhat immediate from the syntax of values.
+
+#### Progress Theorem
+
+**Theorem**: suppose that t is a well-typed term of type T. Then either t is a value, or else there exists some t′ such that t⟶t′.
+
+**Proof**: by induction on a derivation of t:T.
+
+*   The [T-True](https://kjaer.io/fos/#mjx-eqn-eq%3At-true), [T-False](https://kjaer.io/fos/#mjx-eqn-eq%3At-false) and [T-Zero](https://kjaer.io/fos/#mjx-eqn-eq%3At-zero) are immediate, since t is a value in these cases.
+*   For [T-If](https://kjaer.io/fos/#mjx-eqn-eq%3At-if), we have t\=if t1 then t2 else t3, with t1:Bool, t2:T and t3:T. By the induction hypothesis, there is some t′1 such that t1⟶t′1.
+    
+    If t1 is a value, then rule 1 of the [canonical form lemma](https://kjaer.io/fos/#canonical-form) tells us that t1 must be either true or false, in which case [E-IfTrue](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-iftrue) or [E-IfFalse](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-iffalse) applies to t.
+    
+    Otherwise, if t1⟶t′1, then by [E-If](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-if), t⟶if t′1 then t2 else t3
+    
+*   For [T-Succ](https://kjaer.io/fos/#mjx-eqn-eq%3At-succ), we have t\=succ t1.
+    
+    t1 is a value, by rule 5 of the [inversion lemma](https://kjaer.io/fos/#inversion-lemma) and by rule 2 of the [canonical form](https://kjaer.io/fos/#canonical-form), t1\=nv for some numeric value nv. Therefore, succ (t1) is a value. If t1⟶t′1, then t⟶succ t1.
+    
+*   The cases for [T-Zero](https://kjaer.io/fos/#mjx-eqn-eq%3At-zero), [T-Pred](https://kjaer.io/fos/#mjx-eqn-eq%3At-pred) and [T-IsZero](https://kjaer.io/fos/#mjx-eqn-eq%3At-iszero) are similar.
+
+#### Preservation Theorem
+
+**Theorem**: Types are preserved by one-step evaluation. If t:T and t⟶t′, then t′:T.
+
+**Proof**: by induction on the given typing derivation
+
+*   For [T-True](https://kjaer.io/fos/#mjx-eqn-eq%3At-true) and [T-False](https://kjaer.io/fos/#mjx-eqn-eq%3At-false), the precondition doesn’t hold (no reduction is possible), so it’s trivially true. Indeed, t is already a value, either t\= true or t\= false.
+*   For [T-If](https://kjaer.io/fos/#mjx-eqn-eq%3At-if), there are three evaluation rules by which t⟶t′ can be derived, depending on t1
+    *   If t1\=true, then by [E-IfTrue](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-iftrue) we have t′\=t2, and from rule 3 of the [inversion lemma](https://kjaer.io/fos/#inversion-lemma-1) and the assumption that t:T, we have t2:T, that is t′:T
+    *   If t1\=false, then by [E-IfFalse](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-iffalse) we have t′\=t3, and from rule 3 of the [inversion lemma](https://kjaer.io/fos/#inversion-lemma-1) and the assumption that t:T, we have t3:T, that is t′:T
+    *   If t1⟶t′1, then by the induction hypothesis, t′1:Bool. Combining this with the assumption that t2:T and t3:T, we can apply [T-If](https://kjaer.io/fos/#mjx-eqn-eq%3At-if) to conclude if t′1 then t2 else t3:T, that is t′:T
+
+### Messing with it
+
+#### Removing a rule
+
+What if we remove [E-PredZero](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-predzero)? Then `pred 0` type checks, but it is stuck and is not a value; the [progress theorem](https://kjaer.io/fos/#progress-theorem) fails.
+
+#### Changing type-checking rule
+
+What if we change the [T-If](https://kjaer.io/fos/#mjx-eqn-eq%3At-if) to the following?
+
+\frac{t1:Bool  t2:Nat  t3:Nat}{(if t1 then t2 else t3):Nat}	(T-If 2)
+
+This doesn’t break our type system. It’s still sound, but it rejects if-else expressions that return other things than numbers (e.g. booleans). But that is an expressiveness problem, not a soundness problem; our type system disallows things that would otherwise be fine by the evaluation rules.
+
+#### Adding bit
+
+We could add a boolean to natural function `bit(t)`. We’d have to add it to the grammar, add some evaluation and typing rules, and prove progress and preservation.
+
+bit true⟶0
+bit false⟶1
+\frac{t1⟶t′1}{bit t1⟶bit t′1}
+\frac{t:Bool}{bit t:Nat}
+
+We’ll do something similar this below, so the full proof is omitted.
+
+Simply typed lambda calculus
+----------------------------
+
+Simply Typed Lambda Calculus (STLC) is also denoted λ→. The “pure” form of STLC is not very interesting on the type-level (unlike for the term-level of pure lambda calculus), so we’ll allow base values that are not functions, like booleans and integers. To talk about STLC, we always begin with some set of “base types”:
+
+```
+    T ::=     // types
+        Bool    // type of booleans
+        T -> T  // type of functions
+```
+    
+
+In the following examples, we’ll work with a mix of our previously defined toy language, and lambda calculus. This will give us a little syntactic sugar.
+
+    
+```
+    t ::=                // terms
+        x                   // variable
+        λx. t               // abstraction
+        t t                 // application
+        true                // constant true
+        false               // constant false
+        if t then t else t  // conditional
+    
+    v ::=   // values
+        λx. t  // abstraction value
+        true   // true value
+        false  // false value
+```
+
+    
+
+### Type annotations
+
+We will annotate lambda-abstractions with the expected type of the argument, as follows:
+
+λx:T1. t1
+
+We could also omit it, and let type inference do the job (as in OCaml), but for now, we’ll do the above. This will make it simpler, as we won’t have to discuss inference just yet.
+
+### Typing rules
+
+In STLC, we’ve introduced abstraction. To add a typing rule for that, we need to encode the concept of an environment Γ, which is a set of variable assignments. We also introduce the “turnstile” symbol ⊢, meaning that the environment can verify the right hand-side typing, or that Γ must imply the right-hand side.
+
+\frac{(Γ∪(x1:T1))⊢t2:T2}{Γ⊢(λx:T1. t2):T1→T2}	(T-Abs)
+\frac{x:T∈Γ}{Γ⊢x:T}		(T-Var)
+\frac{Γ⊢t1:T11→T12  Γ⊢t2:T11}{Γ⊢t1 t2:T12} (T-App)
+
+This additional concept must be taken into account in our definition of progress and preservation:
+
+*   **Progress**: If Γ⊢t:T, then either t is a value or else t⟶t′ for some t′
+*   **Preservation**: If Γ⊢t:T and t⟶t′, then Γ⊢t′:T
+
+To prove these, we must take the same steps as above. We’ll introduce the inversion lemma for typing relations, and restate the canonical forms lemma in order to prove the progress theorem.
+
+### Inversion lemma
+
+Let’s start with the inversion lemma.
+
+1.  If Γ⊢true:R then R\=Bool
+2.  If Γ⊢false:R then R\=Bool
+3.  If Γ⊢if t1 then t2 else t3:R then Γ⊢t1:Bool and Γ⊢t2,t3:R.
+4.  If Γ⊢x:R then x:R∈Γ
+5.  If Γ⊢λx:T1. t2:R then R\=T1→T2 for some R2 with Γ∪(x:T1)⊢t2:R2
+6.  If Γ⊢t1 t2:R then there is some type T11 such that Γ⊢t1:T11→R and Γ⊢t2:T11.
+
+### Canonical form
+
+The canonical forms are given as follows:
+
+1.  If v is a value of type Bool, then it is either true or false
+2.  If v is a value of type T1→T2 then v has the form λx:T1. t2
+
+### Progress
+
+Finally, we get to prove the progress by induction on typing derivations.
+
+**Theorem**: Suppose that t is a closed, well typed term (that is, Γ⊢t:T for some type T). Then either t is a value, or there is some t′ such that t⟶t′.
+
+*   For boolean constants, the proof is immediate as t is a value
+*   For variables, the proof is immediate as t is closed, and the precondition therefore doesn’t hold
+*   For abstraction, the proof is immediate as t is a value
+*   Application is the only case we must treat.
+    
+    Consider t\=t1 t2, with Γ⊢t1:T11→T12 and Γ⊢t2:T11.
+    
+    By the induction hypothesis, t1 is either a value, or it can make a step of evaluation. The same goes for t2.
+    
+    If t1 can reduce, then rule [E-App1](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-app1) applies to t. Otherwise, if it is a value, and t2 can take a step, then [E-App2](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-app2) applies. Otherwise, if they are both values (and we cannot apply β\-reduction), then the canonical forms lemma above tells us that t1 has the form λx:T11. t12, and so rule [E-AppAbs](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-appabs) applies to t.
+    
+
+### Preservation
+
+**Theorem**: If Γ⊢t:T and t⟶t′ then Γ⊢t′:T.
+
+**Proof**: by induction on typing derivations. We proceed on a case-by-case basis, as we have done so many times before. But one case is hard: application.
+
+For t\=t1 t2, such that Γ⊢t1:T11→T12 and Γ⊢t2:T11, and where T\=T12, we want to show Γ⊢t′:T12.
+
+To do this, we must use the [inversion lemma for evaluation](https://kjaer.io/fos/#inversion-lemma) (note that we haven’t written it down for STLC, but the idea is the same). There are three subcases for it, starting with the following:
+
+The left-hand side is t1\=λx:T11. t12, and the right-hand side of application t2 is a value v2. In this case, we know that the result of the evaluation is given by t′\=\[x↦v2\]t12.
+
+And here, we already run into trouble, because we do not know about how types act under substitution. We will therefore need to introduce some lemmas.
+
+#### Weakening lemma
+
+Weakening tells us that we can _add_ assumptions to the context without losing any true typing statements:
+
+If Γ⊢t:T, and the environment Γ has no information about x—that is, x∉dom(Γ)—then the initial assumption still holds if we add information about x to the environment:
+
+(Γ∪(x:S))⊢t:T
+
+Moreover, the latter ⊢ derivation has the same depth as the former.
+
+#### Permutation lemma
+
+Permutation tells us that the order of assumptions in Γ does not matter.
+
+If Γ⊢t:T and Δ is a permutation of Γ, then Δ⊢t:T.
+
+Moreover, the latter ⊢ derivation has the same depth as the former.
+
+#### Substitution lemma
+
+Substitution tells us that types are preserved under substitution.
+
+That is, if Γ∪(x:S)⊢t:T and Γ⊢s:S, then Γ⊢\[x↦s\]t:T.
+
+The proof goes by induction on the derivation of Γ∪(x:S)⊢t:T, that is, by cases on the final typing rule used in the derivation.
+
+*   Case [T-App](https://kjaer.io/fos/#mjx-eqn-eq%3At-app): in this case, t\=t1 t2.
+    
+    Thanks to typechecking, we know that the environment validates (Γ∪(x:S))⊢t1:T2→T1 and (Γ∪(x:S))⊢t2:T2. In this case, the resulting type of the application is T\=T1.
+    
+    By the induction hypothesis, Γ⊢\[x↦s\]t1:T2→T1, and Γ⊢\[x↦s\]t2:T2.
+    
+    By [T-App](https://kjaer.io/fos/#mjx-eqn-eq%3At-app), the environment then also verifies the application of these two substitutions as T: Γ⊢\[x↦s\]t1 \[x↦s\]t2:T. We can factorize the substitution to obtain the conclusion, i.e. Γ⊢\[x↦s\](t1 t2):T
+    
+*   Case [T-Var](https://kjaer.io/fos/#mjx-eqn-eq%3At-var): if t\=z (t is a simple variable z) where z:T∈(Γ∪(x:S)). There are two subcases to consider here, depending on whether z is x or another variable:
+    *   If z\=x, then \[x↦s\]z\=s. The result is then Γ⊢s:S, which is among the assumptions of the lemma
+    *   If z≠x, then \[x↦s\]z\=z, and the desired result is immediate
+*   Case [T-Abs](https://kjaer.io/fos/#mjx-eqn-eq%3At-abs): if t\=λy:T2. t1, with T\=T2→T1, and (Γ∪(x:S)∪(y:T2))⊢t1:T1.
+    
+    Based on our [hygiene convention](https://kjaer.io/fos/#alpha-conversion), we may assume x≠y and y∉fv(s).
+    
+    Using [permutation](https://kjaer.io/fos/#permutation-lemma) on the first given subderivation in the lemma (Γ∪(x:S)⊢t:T), we obtain (Γ∪(y:T2)∪(x:S))⊢t1:T1 (we have simply changed the order of x and y).
+    
+    Using [weakening](https://kjaer.io/fos/#weakening-lemma) on the other given derivation in the lemma (Γ⊢s:S), we obtain (Γ∪(y:T2))⊢s:S.
+    
+    By the induction hypothesis, (Γ∪(y:T2))⊢\[x↦s\]t1:T1.
+    
+    By [T-Abs](https://kjaer.io/fos/#mjx-eqn-eq%3At-abs), we have Γ⊢(λy:T2. \[x↦s\]t1):T1
+    
+    By the definition of substitution, this is Γ⊢(\[x↦s\]λy:T2. t1):T2→T1.
+    
+
+#### Proof
+
+We’ve now proven the following lemmas:
+
+*   Weakening
+*   Permutation
+*   Type preservation under substitution
+*   Type preservation under reduction (i.e. preservation)
+
+We won’t actually do the proof, we’ve just set up the pieces we need for it.
+
+### Erasure
+
+Type annotations do not play any role in evaluation. In STLC, we don’t do any run-time checks, we only run compile-time type checks. Therefore, types can be removed before evaluation. This often happens in practice, where types do not appear in the compiled form of a program; they’re typically encoded in an untyped fashion. The semantics of this conversion can be formalized by an erasure function:
+
+erase(x)\=x
+erase(λx:T1.t2)\=λx.erase(t2)
+erase(t1 t2)\=erase(t1) erase(t2)
+
+### Curry-Howard Correspondence
+
+The Curry-Howard correspondence tells us that there is a correspondence between constructive logic and typed lambda-calculus with product and sum types.
+
+An implication P⊃Q (which could also be written P⟹Q) can be proven by transforming evidence for P into evidence for Q. A conjunction P∧Q is a [pair](https://kjaer.io/fos/#pairs-1) of evidence for P and evidence for Q. For more examples of these correspondences, see the [Brouwer–Heyting–Kolmogorov (BHK) interpretation](https://en.wikipedia.org/wiki/Brouwer%E2%80%93Heyting%E2%80%93Kolmogorov_interpretation) or [Curry-Howard correspondence](https://en.wikipedia.org/wiki/Curry%E2%80%93Howard_correspondence) on Wikipedia.
+
+
+Propositions <-> Types
+
+P⊃Q or P⟹Q <-> Function type P→Q
+
+P∧Q  <-> [Pair type](https://kjaer.io/fos/#pairs-1) P×Q
+
+P∨Q  <-> [Sum type](https://kjaer.io/fos/#sum-type) P+Q
+
+∃x∈S:ϕ(x)  <-> Dependent type ∑x:S,ϕ(x)
+
+∀x∈S:ϕ(x)  <-> ∀(x:S):ϕ(x)
+
+Proof of P  <-> Term t of type P
+
+P is provable  <-> Type P is inhabited
+
+Proof simplification  <-> Evaluation
+
+In Scala, all types are inhabited except for the bottom type `Nothing`. Singleton types are only inhabited by a single term.
+
+As an example of the equivalence, we’ll see that application is equivalent to [modus ponens](https://en.wikipedia.org/wiki/Modus_ponens):
+
+\frac{Γ⊢t1:P⊃Q  Γ⊢t2:P}{Γ⊢t1  t2:Q}
+
+This also tells us that if we can prove something, we can evaluate it.
+
+How can we prove the following? Remember that → is right-associative.
+
+(A∧B)→C→((C∧A)∧B)
+
+The proof is actually a somewhat straightforward conversion to lambda calculus:
+
+λp:A×B. λc:C. pair(pair(c fst(p)) snd(p))
+
+### Extensions to STLC
+
+#### Base types
+
+Up until now, we’ve defined our base types (such as Nat and Bool) manually: we’ve added them to the syntax of types, with associated constants (zero,true,false) and operators (succ,pred), as well as associated typing and evaluation rules.
+
+This is a lot of minutiae though, especially for theoretical discussions. For those, we can often ignore the term-level inhabitants of the base types, and just treat them as uninterpreted constants: we don’t really need the distinction between constants and values. For theory, we can just assume that some generic base types (e.g. B and C) exist, without defining them further.
+
+#### Unit type
+
+In C-like languages, this type is usually called `void`. To introduce it, we do not add any computation rules. We must only add it to the grammar, values and types, and then add a single typing rule that trivially verifies units.
+
+Γ⊢unit:Unit	(T-Unit)
+
+Units are not too interesting, but _are_ quite useful in practice, in part because they allow for other extensions.
+
+#### Sequencing
+
+We can define sequencing as two statements following each other:
+
+```
+    t ::=
+        ...
+        t1; t2
+```
+    
+
+This implies adding some evaluation and typing rules, defined below:
+
+\frac{t1⟶t′1}{t1; t2⟶t′1; t2}		(E-Seq)
+(unit; t2)⟶t2			(E-SeqNext)
+\frac{Γ⊢t1:Unit  Γ⊢t2:T2}{Γ⊢t1; t2:T2} 	(T-Seq)
+
+But there’s another way that we could define sequencing: simply as syntactic sugar, a derived form for something else. In this way, we define an external language, that is transformed to an internal language by the compiler in the desugaring step.
+
+t1; t2\=(λx:Unit. t2) t1	where x∉ FV(t2)
+
+This is useful to know, because it makes proving soundness much easier. We do not need to re-state the inversion lemma, re-prove preservation and progress. We can simple rely on the proof for the underlying internal language.
+
+#### Ascription
+
+    
+```
+    t ::=
+        ...
+        t as T
+```
+    
+
+Ascription allows us to have a compiler type-check a term as really being of the correct type:
+
+\frac{Γ⊢t1:T}{Γ⊢t1 as T:T}	(T-Ascribe)
+
+This seems like it preserves soundness, but instead of doing the whole proof over again, we’ll just propose a simple desugaring, in which an ascription is equivalent to the term t applied the identity function, typed to return T:
+
+t as T\=(λx:T. x) t
+
+Alternatively, we could do the whole proof over again, and institute a simple evaluation rule that ignores the ascription.
+
+v1 as T⟶v1	(E-Ascribe)
+
+#### Pairs
+
+We can introduce pairs into our grammar.
+
+    
+```
+    t ::= 
+        ...
+        {t, t}    // pair
+        t.1       // first projection
+        t.2       // second projection
+    
+    v ::=
+        ...
+        {v, v}    // pair value
+    
+    T ::=
+        ...
+        T1 x T2   // product types
+ ```   
+    
+
+Note that product types are right-associative: A×B×C\=A×(B×C). We can also introduce evaluation rules for pairs:
+
+{v1,v2}.1⟶v1	(E-PairBeta1)
+{v1,v2}.2⟶v2	(E-PairBeta2)
+\frac{t1⟶t′1}{t1.1⟶t′1.1}	(E-Proj1)
+\frac{t1⟶t′1}{t1.2⟶t′1.2}	(E-Proj2)
+\frac{t1⟶t′1}{{t1,t2}⟶{t′1,t2}}	(E-Pair1)
+\frac{t2⟶t′2}{{t1,t2}⟶{t1,t′2}}	(E-Pair2)
+
+The typing rules are then:
+
+\frac{Γ⊢t1:T1  Γ⊢t2:T2}{Γ⊢{t1,t2}:T1×T2}	(T-Pair)
+\frac{Γ⊢t1:T11×T12}{Γ⊢t1.1:T11}		(T-Proj1)
+\frac{Γ⊢t1:T11×T12}{Γ⊢t1.2:T12} 	(T-Proj2)
+
+Pairs have to be added “the hard way”: we do not really have a way to define them in a derived form, as we have no existing language features to piggyback onto.
+
+#### Tuples
+
+Tuples are like pairs, except that we do not restrict it to 2 elements; we allow an arbitrary number from 1 to n. We can use pairs to encode tuples: `(a, b, c)` can be encoded as `(a, (b, c))`. Though for performance and convenience, most languages implement them natively.
+
+#### Records
+
+We can easily generalize tuples to records by annotating each field with a label. A record is a bundle of values with labels; it’s a map of labels to values and types. Order of records doesn’t matter, the only index is the label.
+
+If we allow numeric labels, then we can encode a tuple as a record, where the index implicitly encodes the numeric label of the record representation.
+
+No mainstream language has language-level support for records (two case classes in Scala may have the same arguments but a different constructor, so it’s not quite the same; records are more like anonymous objects). This is because they’re often quite inefficient in practice, but we’ll still use them as a theoretical abstraction.
+
+### Sums and variants
+
+#### Sum type
+
+A sum type T\=T1+T2 is a _disjoint_ union of T1 and T2. Pragmatically, we can have sum types in Scala with case classes extending an abstract object:
+
+```
+    sealed trait Option[+T]
+    case class Some[+T] extends Option[T]
+    case object None extends Option[Nothing]
+```
+    
+
+In this example, `Option = Some + None`. We say that T1 is on the left, and T2 on the right. Disjointness is ensured by the tags inl and inr. We can _think_ of these as functions that inject into the left or right of the sum type T:
+
+inl:T1→T1+T2
+inr:T2→T1+T2
+
+Still, these aren’t really functions, they don’t actually have function type. Instead, we use them them to tag the left and right side of a sum type, respectively.
+
+Another way to think of these stems from [Curry-Howard correspondence](https://kjaer.io/fos/#curry-howard-correspondence). Recall that in the [BHK interpretation](https://en.wikipedia.org/wiki/Brouwer%E2%80%93Heyting%E2%80%93Kolmogorov_interpretation), a proof of P∨Q is a pair `<a, b>` where `a` is 0 (also denoted inl) and `b` a proof of P, _or_ `a` is 1 (also denoted inr) and `b` is a proof of Q.
+
+To use elements of a sum type, we can introduce a `case` construct that allows us to pattern-match on a sum type, allowing us to distinguishing the left type from the right one.
+
+We need to introduce these three special forms in our syntax:
+
+    
+``` 
+    t ::= ...                           // terms
+        inl t                              // tagging (left)
+        inr t                              // tagging (right)
+        case t of inl x => t | inr x => t  // case
+    
+    v ::= ... // values
+        inl v   // tagged value (left)
+        inr v   // tagged value (right)
+    
+    T ::= ...  // types
+        T + T     // sum type
+```
+
+    
+
+This also leads us to introduce some new evaluation rules:
+
+  \text{case } (\text{inl } v_0) \text{ of } \\
+  \quad \text{inl } x_1 \Rightarrow t_1 \\
+  \quad \text{inr } x_2 \Rightarrow t_2 \\
+  \rightarrow [x_1 \mapsto v_0]t_1 	(E-CaseInl)
+
+
+\text{case } (\text{inr } v_0) \text{ of } \\
+\quad \text{inl } x_1 \Rightarrow t_1 \\
+\quad \text{inr } x_2 \Rightarrow t_2 \\
+\rightarrow [x_2 \mapsto v_0]t_2	(E-CaseInr)
+
+\frac{\text{case } t_0 \text{ of }}
+{\quad \text{inl } x_1 \Rightarrow t_1 \\
+\quad \text{inr } x_2 \Rightarrow t_2 \\
+\rightarrow \text{case } t_0' \text{ of } \\
+\quad \text{inl } x_1 \Rightarrow t_1 \\
+\quad \text{inr } x_2 \Rightarrow t_2 \\
+\text{where } t_0 \rightarrow t_0'}	(E-Case)
+
+\frac{t_1 \rightarrow t_1'}
+{\text{inl } t_1 \rightarrow \text{inl } t_1'}	(E-Inl)
+
+\frac{t_1 \rightarrow t_1'}
+{\text{inr } t_1 \rightarrow \text{inr } t_1'}	(E-Inr)
+
+And we’ll also introduce three typing rules:
+
+\frac{Γ⊢t1:T1}{Γ⊢inl t1:T1+T2}		(T-Inl)
+\frac{Γ⊢t1:T2}{Γ⊢inr t1:T1+T2}		(T-Inr)
+\frac{Γ⊢t0:T1+T2  Γ∪(x1:T1)⊢t1:T   Γ∪(x2:T2)⊢t2:T}{Γ⊢case t0 of inl x1⇒t1∣inr x2⇒t2:T}	(T-Case)
+
+#### Sums and uniqueness of type
+
+The rules [T-Inr](https://kjaer.io/fos/#mjx-eqn-eq%3At-inr) and [T-Inl](https://kjaer.io/fos/#mjx-eqn-eq%3At-inl) may seem confusing at first. We only have one type to deduce from, so what do we assign to T2 and T1, respectively? These rules mean that we have lost uniqueness of types: if t has type T, then inl t has type T+U **for every** U.
+
+There are a couple of solutions to this:
+
+1.  We can infer U as needed during typechecking
+2.  Give constructors different names and only allow each name to appear in one sum type. This requires generalization to [variants](https://kjaer.io/fos/#variants), which we’ll see next. OCaml adopts this solution.
+3.  Annotate each inl and inr with the intended sum type.
+
+For now, we don’t want to look at type inference and variance, so we’ll choose the third approach for simplicity. We’ll introduce these annotation as ascriptions on the injection operators in our grammar:
+
+```
+    t ::=
+        ...
+        inl t as T
+        inr t as T
+    
+    v ::=
+        ...
+        inl v as T
+        inr v as T
+```
+    
+
+The evaluation rules would be exactly the same as previously, but with ascriptions in the syntax. The injection operators just now also specify _which_ sum type we’re injecting into, for the sake of uniqueness of type.
+
+#### Variants
+
+Just as we generalized binary products to labeled records, we can generalize binary sums to labeled variants. We can label the members of the sum type, so that we write ⟨l1:T1,l2:T2⟩ instead of T1+T2 (l1 and l2 are the labels).
+
+As a motivating example, we’ll show a useful idiom that is possible with variants, the optional value. We’ll use this to create a table. The example below is just like in OCaml.
+
+    
+```
+    OptionalNat = <none: Unit,  some: Nat>;
+    Table = Nat -> OptionalNat;
+    emptyTable = λt: Nat. <none=unit> as OptionalNat;
+    
+    extendTable = 
+        λt: Table. λkey: Nat. λval: Nat.
+            λsearch: Nat.
+                if (equal search key) then <some=val> as OptionalNat
+                else (t search)
+```
+    
+
+The implementation works a bit like a linked list, with linear look-up. We can use the result from the table by distinguishing the outcome with a `case`:
+
+``` 
+    x = case t(5) of
+        <none=u> => 999
+      | <some=v> => v
+```
+    
+
+### Recursion
+
+In STLC, all programs terminate. We’ll [go into a little more detail later](https://kjaer.io/fos/#strong-normalization), but the main idea is that evaluation of a well-typed program is guaranteed to halt; we say that the well-typed terms are _normalizable_.
+
+Indeed, the infinite recursions from untyped lambda calculus (terms like omega and fix) are not typable, and thus cannot appear in STLC. Since we can’t express fix in STLC, instead of defining it as a term in the language, we can add it as a primitive instead to get recursion.
+
+```   
+    t ::=
+        ...
+        fix t
+```
+    
+
+We’ll need to add evaluation rules recreating its behavior, and a typing rule that restricts its use to the intended use-case.
+
+fix (λx:T1. t2)⟶\[x↦(fix (λx:T1. t2))\]t2	(E-FixBeta)
+\frac{t1⟶t′1}{fix t1⟶fix t′1}		(E-Fix)
+\frac{Γ⊢t1:T1→T1}{Γ⊢fix t1:T1} 	(T-Fix)
+
+In order for a function to be recursive, the function needs to map a type to the same type, hence the restriction of T1→T1. The type T1 will itself be a function type if we’re doing a recursion. Still, note that the type system doesn’t enforce this. There will actually be situations in which it will be handy to use something else than a function type inside a fix operator.
+
+Seeing that this fixed-point notation can be a little involved, we can introduce some nice syntactic sugar to work with it:
+
+letrec x:T1\=t1 in t2\=let x\=fix (λx:T1. t1) in t2
+
+This t1 can now refer to the x; that’s the convenience offered by the construct. Although we don’t strictly need to introduce typing rules (it’s syntactic sugar, we’re relying on existing constructs), a typing rule for this could be:
+
+\frac{Γ∪(x:T1)⊢t1:T1	Γ∪(x:T1)⊢t2:T2}{Γ⊢letrec x:T1\=t1 in t2:T2}
+
+In Scala, a common error message is that a recursive function needs an explicit return type, for the same reasons as the typing rule above.
+
+### References
+
+#### Mutability
+
+In most programming languages, variables are (or can be) mutable. That is, variables can provide a name referring to a previously calculated value, as well as a way of overwriting this value with another (under the same name). How can we model this in STLC?
+
+Some languages (e.g. OCaml) actually formally separate variables from mutation. In OCaml, variables are only for naming, the binding between a variable and a value is immutable. However, there is the concept of _mutable values_, also called _reference cells_ or _references_. This is the style we’ll study, as it is easier to work with formally. A mutable value is represented in the type-level as a `Ref T` (or perhaps even a `Ref(Option T)`, since the null pointer cannot produce a value).
+
+The basic operations are allocation with the `ref` operator, dereferencing with `!` (in C, we use the `*` prefix), and assignment with `:=`, which updates the content of the reference cell. Assignment returns a `unit` value.
+
+#### Aliasing
+
+Two variables can reference the same cell: we say that they are _aliases_ for the same cell. Aliasing is when we have different references (under different names) to the same cell. Modifying the value of the reference cell through one alias modifies the value for all other aliases.
+
+The possibility of aliasing is all around us, in object references, explicit pointers (in C), arrays, communication channels, I/O devices; there’s practically no way around it. Yet, alias analysis is quite complex, costly, and often makes is hard for compilers to do optimizations they would like to do.
+
+With mutability, the order of operations now matters; `r := 1; r := 2` isn’t the same as `r := 2; r := 1`. If we recall the [Church-Rosser theorem](https://kjaer.io/fos/#confluence-in-full-beta-reduction), we’ve lost the principle that all reduction paths lead to the same result. Therefore, some language designers disallow it (Haskell). But there are benefits to allowing it, too: efficiency, dependency-driven data flow (e.g. in GUI), shared resources for concurrency (locks), etc. Therefore, most languages provide it.
+
+Still, languages without mutability have come up with a bunch of abstractions that allow us to have some of the benefits of mutability, like monads and lenses.
+
+#### Typing rules
+
+We’ll introduce references as a type `Ref T` to represent a variable of type `T`. We can construct a reference as `r = ref 5`, and access the contents of the reference using `!r` (this would return `5` instead of `ref 5`).
+
+Let’s define references in our language:
+
+    
+```
+    t ::=          // terms
+        unit          // unit constant
+        x             // variable
+        λx: T. t      // abstraction
+        t t           // application
+        ref t         // reference creation
+        !t            // dereference
+        t := t        // assignment
+```
+
+   
+\frac{Γ⊢t1:T1}{Γ⊢ref t1:Ref T1}		(T-Ref)
+\frac{Γ⊢t1:Ref T1}{Γ⊢!t1:T1}		(T-Deref)
+\frac{Γ⊢t1:Ref T1  Γ⊢t2:T1}{Γ⊢t1:\=t2:Unit}	(T-Assign)
+
+#### Evaluation
+
+What is the _value_ of `ref 0`? The crucial observation is that evaluation `ref 0` must _do_ something. Otherwise, the two following would behave the same:
+
+    
+``` 
+    r = ref 0
+    s = ref 0
+    
+    r = ref 0 
+    s = r
+```
+    
+
+Evaluating `ref 0` should allocate some storage, and return a reference (or pointer) to that storage. A reference names a location in the **store** (also known as the _heap_, or just _memory_). Concretely, the store could be an array of 8-bit bytes, indexed by 32-bit integers. More abstractly, it’s an array of values, or even more abstractly, a partial function from locations to values.
+
+We can introduce this idea of locations in our syntax. This syntax is exactly the same as the previous one, but adds the notion of locations:
+
+    
+```
+    v ::=         // values
+        unit         // unit constant
+        λx: T. t     // abstraction value
+        l            // store location
+    
+    t ::=         // terms
+        unit         // unit constant
+        x            // variable
+        λx: T. t     // abstraction
+        t t          // application
+        ref t        // reference creation
+        !t           // dereference
+        t := t       // assignment
+        l            // store location 
+```
+    
+
+This doesn’t mean that we’ll allow programmers to write explicit locations in their programs. We just use this as a modeling trick; we’re enriching the internal language to include some run-time structures.
+
+With this added notion of stores and locations, the result of an evaluation now depends on the store in which it is evaluated, which we need to reflect in our evaluation rules. Evaluation must now include terms t **and** store μ:
+
+t∣μ⟶t′∣μ′
+
+Let’s take a look for the evaluation rules for STLC with references, operator by operator.
+
+\frac{t1∣μ⟶t′1∣μ′}{t1:\=t2∣μ⟶t′1:\=t2∣μ′}		(E-Assign1)
+\frac{t2∣μ⟶t′2∣μ′}{t1:\=t2∣μ⟶t1:\=t′2∣μ′}		(E-Assign2)
+l:\=v2∣μ⟶unit∣\[l↦v2\]μ			(E-Assign)
+
+The assignments [E-Assign1](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-assign1) and [E-Assign2](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-assign2) evaluate terms until they become values. When they have been reduced, we can do that actual assignment: as per [E-Assign](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-assign), we update the store and return return `unit`.
+
+\frac{t1∣μ⟶t′1∣μ′}{ref t1∣μ⟶ref t′1∣μ′}		(E-Ref)
+\frac{l∉dom(μ)}{ref v1∣μ⟶l∣(μ∪(l↦v1))}		(E-RefV)
+
+A reference ref t1 first evaluates t1 until it is a value ([E-Ref](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-ref)). To evaluate the reference operator, we find a fresh location l in the store, to which it binds v1, and it returns the location l.
+
+\frac{t1∣μ⟶t′1∣μ′}{!t1∣μ⟶!t′1∣μ′}		(E-Deref)
+\frac{μ(l)\=v}{!l∣μ⟶v∣μ}	(E-DerefLoc)
+
+We find the same congruence rule as usual in [E-Deref](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-deref), where a term !t1 first evaluates t1 until it is a value. Once it is a value, we can return the value in the current store using [E-DerefLoc](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-derefloc).
+
+The evaluation rules for abstraction and application are augmented with stores, but otherwise unchanged.
+
+#### Store typing
+
+What is the type of a location? The answer to this depends on what is in the store. Unless we specify it, a store could contain anything at a given location, which is problematic for typechecking. The solution is to type the locations themselves. This leads us to a typed store:
+
+μ\=(l1↦Nat,l2↦λx:Unit.x)
+
+As a first attempt at a typing rule, we can just say that the type of a location is given by the type of the value in the store at that location:
+
+\frac{Γ⊢μ(l):T1}{Γ⊢l:Ref T1}
+
+This is problematic though; in the following, the typing derivation for !l2 would be infinite because we have a cyclic reference:
+
+μ\= (l1↦λx:Nat. !l2 x,l2↦λx:Nat. !l1 x)
+
+The core of the problem here is that we would need to recompute the type of a location every time. But shouldn’t be necessary. Seeing that references are strongly typed as `Ref T`, we know exactly what type of value we can place in a given store location. Indeed, the typing rules we chose for references guarantee that a given location in the store always is used to hold values of the same type.
+
+So to fix this problem, we need to introduce a **store typing**. This is a partial function from location to types, which we’ll denote by Σ.
+
+Suppose we’re given a store typing Σ describing the store μ. We can use Σ to look up the types of locations, without doing a lookup in μ:
+
+Σ(l)\=T1Γ∣Σ⊢l:Ref T1(T-Loc)
+
+This tells us how to check the store typing, but how do we create it? We can start with an empty typing Σ\=∅, and add a typing relation with the type of v1 when a new location is created during evaluation of [E-RefV](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-refv).
+
+The rest of the typing rules remain the same, but are augmented with the store typing. So in conclusion, we have updated our evaluation rules with a _store_ μ, and our typing rules with a _store typing_ Σ.
+
+#### Safety
+
+Let’s take a look at progress and preservation in this new type system. Preservation turns out to be more interesting, so let’s look at that first.
+
+We’ve added a store and a store typing, so we need to add those to the statement of preservation to include these. Naively, we’d write:
+
+Γ∣Σ⊢t:T and t∣μ⟶t′∣μ′⟹Γ∣Σ⊢t′:T
+
+But this would be wrong! In this statement, Σ and μ would not be constrained to be correlated at all, which they need to be. This constraint can be defined as follows:
+
+A store μ is well typed with respect to a typing context Γ and a store typing Σ (which we denote by Γ∣Σ⊢μ) if the following is satisfied:
+
+dom(μ)\=dom(Σ)andΓ∣Σ⊢μ(l):Σ(l), ∀l∈dom(μ)
+
+This gets us closer, and we can write the following preservation statement:
+
+Γ∣Σ⊢t:T and t∣μ⟶t′∣μ and Γ∣Σ⊢μ⟹Γ∣Σ⊢t′:T
+
+But this is still wrong! When we create a new cell with [E-RefV](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-refv), we would break the correspondence between store typing and store.
+
+The correct version of the progress theorem is the following:
+
+Γ∣Σ⊢t:T and t∣μ⟶t′∣μ and Γ∣Σ⊢μ⟹for some Σ′⊇Σ,Γ∣Σ′⊢t′:T
+
+This progress theorem just asserts that there is _some_ store typing Σ′⊇Σ (agreeing with Σ on the values of all old locations, but that may have also add new locations), such that t′ is well typed in Σ′.
+
+The progress theorem must also be extended with stores and store typings:
+
+Suppose that t is a closed, well-typed term; that is, ∅∣Σ⊢t:T for some type T and some store typing Σ. Then either t is a value or else, for any store μ such that ∅∣Σ⊢μ[2](https://kjaer.io/fos/#fn:well-typed-store-notation), there is some term t′ and store μ′ with t∣μ⟶t′∣μ′.
+
+Type reconstruction and polymorphism
+------------------------------------
+
+In type checking, we wanted to, given Γ, t and T, check whether Γ⊢t:T. So far, for type checking to take place, we required explicit type annotations.
+
+In this section, we’ll look into **type reconstruction**, which allows us to infer types when type annotations aren’t present: given Γ and t, we want to find a type T such that Γ⊢t:T.
+
+Immediately, we can see potential problems with this idea:
+
+*   Abstractions without the parameter type annotation seem complicated to reconstruct (a parameter could almost have any type)
+*   A term can have many types
+
+To solve these problems, we’ll introduce polymorphism into our type system.
+
+### Constraint-based Typing Algorithm
+
+The idea is to split the work in two: first, we want to generate and record constraints, and then, unify them (that is, attempt to satisfy the constraints).
+
+In the following, we’ll denote constraints as a set of equations {Ti^\=Ui}i\=1,…,m, constraining type variables Ti to actual types Ui.
+
+#### Constraint generation
+
+The constraint generation algorithm can be described as the following function TP:Judgment→Equations
+
+```
+    TP: Judgment -> Equations
+    TP(Γ ⊦ t : T) = case t of
+        x     :    {Γ(x) ^= T}
+    
+        λx. t1:    let a, b fresh in
+                   {(a -> b) ^= T} ∪
+                   TP(Γ, (x: a) ⊦ t1 : b)
+    
+        t1 t2 :    let a fresh in
+                   TP(Γ ⊦ t1 : a -> T) ∪
+                   TP(Γ ⊦ t2 : a)
+```
+    
+
+This creates a set of constraints between type variables and the expected types.
+
+The above essentially gives us constraint generation rules in algorithmic form. An alternative notation is as to give the set of constraint typing relations, which are denoted as:
+
+Γ⊢t:T∣χC
+
+This can be read as “a term t has type T in the environment Γ whenever constraints C with type variables χ are satisfied”. The χ subscript keeps track of the fresh variables created in the various subderivations, and ensures that they are distinct.
+
+The implementation we gave above could also be described by the following constraint generation rules:
+
+\frac{x:T∈Γ}{Γ⊢x:T∣∅{}}		(CT-Var)
+\frac{Γ∪(x:T1)⊢t2:T2∣χC}{Γ⊢λx:T1. t2:T1→T2∣χC}		(CT-Abs)
+\frac{Γ⊢t1:T1∣_{χ1} C1Γ⊢t2:T2∣_{χ2}C2}{Γ⊢t1 t2:X∣_{χ1∪χ2∪{X}}C1∪C2∪{T1 ^\= T2→X}	(CT-App)
+
+We haven’t explicitly written it in [CT-App](https://kjaer.io/fos/#mjx-eqn-eq%3Act-app), but we expect χ1 and χ2 to be distinct (i.e. χ1∩χ2\=∅), and we expect X to be fresh (i.e. not clash with anything else).
+
+#### Soundness and completeness
+
+In general a type reconstruction algorithm A assigns to an environment Γ and a term t a set of types A(Γ,t).
+
+The algorithm is **sound** if for every type T∈A(Γ,t) we can prove the judgment Γ⊢t:T.
+
+The algorithm is **complete** if for every provable judgment Γ⊢t:T we have T∈A(Γ,t).
+
+Soundness and completeness are the two directions of the following implication:
+
+the algorithm can prove it⟺it holds
+
+Soundness and completeness are about the ⇐ and ⇒ directions of the above, respectively. The TP function we defined previously for STLC is sound and complete, and the relationship is thus ⟺. We can write this mathematically as follows:
+
+Γ⊢t:T⟺∃¯b s.t. \[a↦T\]EQNS
+
+Where:
+
+*   a is a new type variable
+*   EQNS\=TP(Γ⊢t:a) is the set of type constraints
+*   ¯b\=tv(EQNS)∖tv(Γ), where tv denotes the set of free type variables.
+*   \[a↦T\]EQNS is notation for replacing a with T in EQNS
+
+#### Substitutions
+
+Now that we’ve generated a constraint set in the form C\={Ti ^\= Ui}i\=1,…,m, we’d like a way to substitute these constraints into real types. We must generate a set of substitutions:
+
+s\={aj↦T′j}_{j\=1,…,n}
+
+These substitutions cannot be cyclical. The type variables may not appear recursively on their right-hand side (directly or indirectly). We can write this requirement as:
+
+aj∉tv(T′k)for j\=1,…,n, k\=j,…n
+
+This substitution is an idempotent mapping from type variables to types, mapping all but a finite number of type variables to themselves. We can think of a substitution as a set of equations:
+
+{a ^\= T},a∉tv(T)
+
+Alternatively, we can think of it as a function transforming types (based on the set of equations). Substitution is applied in a straightforward way:
+
+s(X)\= T if (X↦T)∈s 	X otherwise
+s(Nat)\=Nat
+s(Bool)\=Bool
+s(T→U)\=sT→sU
+
+Substitution has two properties:
+
+*   **Idempotence**: s(s(T))\=s(T)
+*   **Composition**: (f∘g) x\=f(g x), the composition of substitutions, is also a substitution
+
+The composition of two substitutions f and g is:
+
+f∘g\=\[X↦f(T)for each (X↦T)∈g \\ X↦T for each (X↦T)∈f with X∉dom(g)\]
+
+Essentially, if g modifies X, we apply the f substitution on top of g(X). If it leaves it unchanged, the result is just f(X).
+
+#### Unification
+
+We present a unification algorithm based on Robinson’s 1965 unification algorithm:
+
+```
+    mgu                      : (Type ^= Type) -> Subst -> Subst
+    mgu(T ^= U) s            = mgu'(sT ^= sU) s
+    
+    mgu'(a ^= a) s           = s
+    mgu'(a ^= T) s           = s ∪ {a → T} if a ∉ tv(T)
+    mgu'(T ^= T) s           = s ∪ {a → T} if a ∉ tv(T)
+    mgu'(T -> T' ^= U -> U') = (mgu(T' ^= U') ◦ mgu(T ^= U)) s
+    mgu'(K[T1, ..., Tn] ^= K[U1, ..., Un]) s
+                             = (mgu(Tn ^= Un) ◦ ... ◦ mgu(T1 ^= U1)) s
+    mgu'(T ^= U) s           = error
+```
+    
+
+This function is called mgu, which stands for most general unifier.
+
+A substitution u is a **unifier** of a set of equations {Ti ^\= Ui} if uTi\=uUi,∀i. This means that it can find an assignment to the type variables in the constraints so that all equations are trivially true.
+
+The substitution is a **most general unifier** if for every other unifier u′ of the same equations, there exists a substitution s such that u′\=s∘u. In other words, it must be less specific (or more general) than all other unifiers.
+
+If we give the following piece of code to a most general unifier, f will be typed as ∀a.a→a, and not Int→Int (more on universal types in [the next chapter](https://kjaer.io/fos/#polymorphism)). Both would be correct, but the former would be most general.
+
+```
+    let f = (λx. x) in f(3)
+```
+    
+
+We won’t prove this, but just state it as a theorem: if we get a set of constraints EQNS which has a unifier, then mgu EQNS{} computes the most general unifier of the constraints. If the constraints do not have a unifier, it fails.
+
+In other words, the TP function is sound and complete.
+
+#### Single-pass unification
+
+Previously, we defined constraint generation. Once we had _all_ the constraints, we passed them on to the unifier, which attempted to find a most general substitution satisfying the constraints.
+
+In practice, however, it’s more common to merge the two, and to unify earlier. This allows us to eliminate some constraints early (which is good for performance), but also to get better error reporting.
+
+    
+```
+    TP: Judgment -> Subst -> Subst
+    TP(Γ ⊦ t : T) = case t of
+        x     :    mgu({Γ(x) ^= T})
+    
+        λx. t1:    let a, b fresh in
+                   mgu({(a -> b) ^= T}) ◦
+                   TP(Γ, (x: a) ⊦ t1 : b)
+    
+        t1 t2 :    let a fresh in
+                   TP(Γ ⊦ t1 : a -> T) ◦
+                   TP(Γ ⊦ t2 : a)
+    
+```
+
+This works because `mgu` is the _most general_ unifier, meaning that it only generates principal types ([more on these later](https://kjaer.io/fos/#principal-types)) at each step. The means that the algorithm never needs to re-analyze a subterm, as it only makes the minimum commitments to achieve typability at each step.
+
+#### Strong normalization
+
+With this typing inference in place, we can be tempted to try to run this on the diverging Ω that [we defined much earlier](https://kjaer.io/fos/#recursion-in-lambda-calculus), or perhaps on the [Y combinator](https://kjaer.io/fos/#recursion-in-lambda-calculus). But as we said before, self-application is not typable. In fact, we can state a stronger assertion:
+
+**Strong Normalization Theorem**: if ⊢t:T, then there is a value V such that t⟶∗V.
+
+In other words, if we can type it, it reduces to a value. In the case of the infinite recursion, we cannot type it, and it does not evaluate to a value (instead, it diverges). So looping infinitely isn’t possible in STLC, which leads us to the corollary of this theorem: **STLC is not Turing complete**.
+
+### Polymorphism
+
+There are multiple forms of polymorphism:
+
+*   **Universal polymorphism** (aka _generic types_): the ability to instantiate type variables
+*   **Inclusion polymorphism** (aka _subtying_): the ability to treat a value of a subtype as a value of one of its supertypes
+*   **Ad-hoc** (aka _overloading_): the ability to define several versions of the same function name with different types.
+
+We’ll concentrate on universal polymorphism, of which there are to variants: explicit and implicit.
+
+#### Explicit polymorphism
+
+In STLC, a term can have many types, but a variable or parameter only has one type. With polymorphism, we open this up: we allow functions to be applied to arguments of many types. The resulting system is known as **System F**.
+
+To do this, we can introduce a type abstraction with Λ: this does the same thing as a regular λ, except that it takes a type. For instance, we could build a polymorphic identity function:
+
+id\=ΛX. λx:X. x
+
+Application is like before, except that we write the type in square brackets \[T\] (like in Scala, where we use `[T]`, or `<T>` in Java). For instance, to get the identity function for natural numbers, we write:
+
+id \[Nat\]
+
+This returns λx:Nat. x, which is an instance of the polymorphic function.
+
+The type of the Λ abstraction is written as ∀X. X→X. This polymorphic type notation ∀a.T can be used as any other type. The typing rules are:
+
+\frac{Γ⊢t:∀a.T}{Γ⊢t\[U\]:\[a↦U\]T}	(∀E)
+\frac{Γ⊢t:T}{Γ⊢Λa.t:∀a.T}	(∀I)
+
+For instance, the signature of `map` could be written as follows in Scala:
+
+```
+    def map[A][B](f: A => B)(xs: List[A]) = ...
+```
+    
+
+In System F we’d write:
+
+ΛX. ΛY. λf:X→Y. λxs:List \[X\]. …
+
+#### Implicit polymorphism
+
+An alternative type system is **Hindley-Milner**, which does not require annotations for parameter types, and instead opts for implicit polymorphism. The idea is that inference treats unannotated named values (i.e. `let ... in ...` statements) as polymorphic types. This explains why this feature is also known as _let-polymorphism_.
+
+To have this feature, we must introduce the notion of **type schemes**. These are not fully general types, but are an internal construct used to type let expressions. A type scheme has the following syntax:
+
+S::\=T∣∀a.S
+
+Not that a plain type is a type scheme, but that we can also add an arbitrary number of universal type arguments ∀a. before it.
+
+The typing rules for the Hindley-Milner are given below. Here, we always use S as a metavariable for type schemes, and T and U for plain (non-polymorphic) types.
+
+Γ∪(x:S)∪Γ′⊢x:S,x∉dom(Γ′)	(Var)
+\frac{Γ⊢t:∀a.T}{Γ⊢t:\[a↦U\]T}	(∀E)
+\frac{Γ⊢t:T	a∉tv(Γ)}{Γ⊢∀a.T}	(∀I)
+\frac{Γ⊢t:S	Γ∪(x:S)⊢t′:T}{Γ⊢let x\=t in t′:T}	(Let)
+\frac{Γ∪(x:T)⊢t:T}{Γ⊢λx.t:T→U}		(→I)
+\frac{Γ⊢t1:T→U	Γ⊢t2:T}{Γ⊢t1 t2:U} 	(→E)
+
+[Var](https://kjaer.io/fos/#mjx-eqn-eq%3Ahm-var) means that we can verify x:S if (x:S) is in the environment and it isn’t overwritten later (in Γ′). This allows us to have some concept of scoping of variables.
+
+[∀E](https://kjaer.io/fos/#mjx-eqn-eq%3Ahm-forall-e) allows to verify specific instances of a polymorphic type, and [∀I](https://kjaer.io/fos/#mjx-eqn-eq%3Ahm-forall-i) allows to generalize to a polymorphic type (with a hygiene condition telling us that the type variable we choose isn’t already in the environment).
+
+[Let](https://kjaer.io/fos/#mjx-eqn-eq%3Ahm-let) is fairly straightforward. [→I](https://kjaer.io/fos/#mjx-eqn-eq%3Ahm-arrow-i) and [→E](https://kjaer.io/fos/#mjx-eqn-eq%3Ahm-arrow-e) are simply as in STLC.
+
+#### Alternative Hindley Milner
+
+A let-in statement can be regarded as shorthand for a substitution:
+
+let x\=t in t′≡\[x↦t\]t′
+
+We can use this to get a revised Hindley-Milner system which we call HM’, where [Let](https://kjaer.io/fos/#mjx-eqn-eq%3Ahm-let) is replaced by the following:
+
+\frac{Γ⊢t:T	Γ⊢\[x↦t\]t′:U}{Γ⊢let x\=t in t′:U}	(Let')
+
+In essence, it only changes the typing rule for `let` so that they perform a step of evaluation before calculating the types. This is equivalent to the previous HM system; we’ll state that as a theorem, without proof.
+
+**Theorem**: Γ⊢HMt:S⟺Γ⊢HM′t:S
+
+The corollary to this theorem is that, if we let t∗ be the result of expanding all `let`s in t using the substitution above, then:
+
+Γ⊢HMt:T⟹Γ⊢F1t∗:T
+
+The converse is true if every let-bound name is used at least once:
+
+Γ⊢HMt:T⟸Γ⊢F1t∗:T
+
+### Principal types
+
+We [previously remarked](https://kjaer.io/fos/#unification) that there is a most general unifier, which instantiates the type variables in the most general way, the _principal_ way. Principal types are a small formalization of this idea.
+
+A type T is a **generic instance** of a type scheme S\=∀α1. …∀αn. T′ if there is a substitution s on α1,…,αn such that T\=sT′. In this case, we write S≤T.
+
+A type scheme S′ is a **generic instance** of a type scheme S iff for all types T:
+
+S′≤T⟹S≤T
+
+In this case, we write S≤S′.
+
+A type scheme S is **principal** (or _most general_) for Γ and t iff:
+
+*   Γ⊢t:S
+*   Γ⊢t:S′⟹S≤S′
+
+A type system TS has the **principal typing property** iff, whenever Γ⊢TSt:S, there exists a principal type scheme for Γ and t.
+
+In other words, a type system with principal types is one where the type engine doesn’t make any choices; it always finds the most general solution. The type checker may fail if it cannot advance without making a choice (e.g. for λx.x+x, where the typechecker would have to choose between Int→Int, Float→Float, etc).
+
+The following can be stated as a theorem:
+
+1.  HM’ without `let` has the principal typing property
+2.  HM’ with `let` has the principal typing property
+3.  HM has the principal typing property
+
+Subtyping
+---------
+
+### Motivation
+
+Under [T-App](https://kjaer.io/fos/#mjx-eqn-eq%3At-app), the following is not well typed:
+
+(λr. {x:Nat}. r.x) {x\=0,y\=1}
+
+We’re passing a record to a function that selects its `x` member. This is not well typed, but would still evaluate just fine; after all, we’re passing the function a _better_ argument than it needs.
+
+In general, we’d like to be able to define hierarchies of classes, with descendants having richer interfaces. These should still be usable instead of their ancestors. We solve this using subtyping.
+
+We achieve this by introducing a subtyping relation S<:T, and a **subsumption rule**:
+
+\frac{Γ⊢t:S	S<:T}{Γ⊢t:T}	(T-Sub)
+
+This rule tells us that if S<:T, then any value of type S can also be regarded as having type T. With this rule in place, we just need to define the rules for when we can assert S<:T.
+
+### Rules
+
+#### General rules
+
+Subtyping is reflective and transitive:
+	
+S<:S	(S-Refl)
+\frac{S<:U	U<:T}{S<:T}	(S-Trans)
+
+#### Records
+
+To solve our previous example, we can introduce subtyping between record types:
+
+{x:Nat,y:Nat}<:{x:Nat}
+
+Using [T-Sub](https://kjaer.io/fos/#mjx-eqn-eq%3At-sub), we can see that our example is now well-typed. Of course, the subtyping rule we introduced here is too specific; we need something more general. We can do this by introducing three rules for subtyping of record types:
+
+{li:T_i^{i∈1…n+k}}<:{l_i:T_i^{i∈1…n}}	(S-RcdWidth)
+\frac{{kj:S_j^{j∈1…n}} is a permutation of {l_i:T_i^{i∈1…n}}}{{k_j:S_j^{j∈1…n}}<:{l_i:T_i^{i∈1…n}}}	(S-RcdPerm)
+\frac{∀i S_i<:T_i}{{l_i:S_i^{i∈1…n}}<:{l_i:T_i^{i∈1…n}}}	(S-RcdDepth)
+
+[S-RcdWidth](https://kjaer.io/fos/#mjx-eqn-eq%3As-rcdwidth) tells us that a record is a supertype of a record with additional fields to the right. Intuitively, the reason that the record _more_ fields is a _subtype_ of the record with fewer fields is because it places a stronger constraint on values, and thus describes fewer values (think of the Venn diagram of possible values).
+
+Of course, adding fields to the right only is not strong enough of a rule, as order in a record shouldn’t matter. We fix this with [S-RcdPerm](https://kjaer.io/fos/#mjx-eqn-eq%3As-rcdperm), which allows us to reorder the record so that all additional fields are on the right: [S-RcdPerm](https://kjaer.io/fos/#mjx-eqn-eq%3As-rcdperm), [S-RcdWidth](https://kjaer.io/fos/#mjx-eqn-eq%3As-rcdwidth) and [S-Trans](https://kjaer.io/fos/#mjx-eqn-eq%3As-trans) allows us to drop arbitrary fields within records.
+
+Finally, [S-RcdDepth](https://kjaer.io/fos/#mjx-eqn-eq%3As-rcddepth) allows for the types of individual fields to be subtypes of the supertype record’s fields.
+
+Note that real languages often choose not to adopt these [structural record subtyping](https://kjaer.io/fos/#aside-structural-vs-declared-subtyping) rules. For instance, Java has no depth subtyping (a subclass may not change the argument or result types of a method of its superclass), no permutation for classes (single inheritance means that each member can be assigned a single index; new members can be added as new indices “on the right”), but has permutation for interfaces (multiple inheritance of interfaces is allowed).
+
+#### Arrow types
+
+Function types are contravariant in the argument and covariant in the return type. The rule is therefore:
+
+\frac{T1<:S1   S2<:T2}{S1→S2<:T1→T2}	(S-Arrow)
+
+#### Top type
+
+For convenience, we have a top type that everything can be a subtype of. In Java, this corresponds to `Object`.
+
+S<:Top(S-Top)
+
+#### Aside: structural vs. declared subtyping
+
+The [subtype relation we defined for records](https://kjaer.io/fos/#records-1) is _structural_: we decide whether S is a subtype of T by examining the structure of S and T. By contrast, most OO languages (e.g. Java) use _declared_ subtyping: S is only a subtype of T if the programmer has stated that it should be (with `extends` or `implements`).
+
+We’ll come back to this when we talk about [Featherweight Java](https://kjaer.io/fos/#featherweight-java).
+
+### Properties of subtyping
+
+#### Safety
+
+The problem with subtyping is that it changes how we do proofs. They become a bit more involved, as the typing relation is no longer syntax directed; when we’re proving things, we need to start making choices, as the rule [T-Sub](https://kjaer.io/fos/#mjx-eqn-eq%3At-sub) could appear anywhere. Still, the proofs are possible.
+
+#### Inversion lemma for subtyping
+
+Before we can prove safety and preservation, we’ll introduce the inversion lemma for subtyping.
+
+**Inversion Lemma**: If U<:T1→T2, then U has the form U1→U2 with T1<:U1 and U2<:T2.
+
+The proof is by induction on subtyping derivations:
+
+*   Case [S-Arrow](https://kjaer.io/fos/#mjx-eqn-eq%3As-arrow), U\=U1→U2: immediate, as U already has the correct form, and as we can deduce T1<:U1 and U2<:T2 from [S-Arrow](https://kjaer.io/fos/#mjx-eqn-eq%3As-arrow).
+*   Case [S-Refl](https://kjaer.io/fos/#mjx-eqn-eq%3As-refl), U\=T1→T2: by applying [S-Refl](https://kjaer.io/fos/#mjx-eqn-eq%3As-refl) twice, we get T1<:T1 and T2<:T2, as required.
+*   Case [S-Trans](https://kjaer.io/fos/#mjx-eqn-eq%3As-trans), U<:W and W<:T1→T2
+    
+    By the IH on the second subderivation, we find that W has the form W1→W2 with T1<:W1 and W2<:T2.
+    
+    Applying the IH again to the first subderivation, we find that U has the form U1→U2 with W1<:U1 and U2<:W2
+    
+    By [S-Trans](https://kjaer.io/fos/#mjx-eqn-eq%3As-trans), we get T1<:U1, and by [S-Trans](https://kjaer.io/fos/#mjx-eqn-eq%3As-trans) again, U2<:T2 as required
+    
+
+#### Inversion lemma for typing
+
+We’ll introduce another lemma, but this time for typing (not subtyping):
+
+**Iversion lemma**: if Γ⊢λx:S1.s2:T1→T2, then T1<:S1 and Γ∪(x:S1)⊢s2:T2.
+
+Again, the proof is by induction on typing derivations:
+
+*   Case [T-Abs](https://kjaer.io/fos/#mjx-eqn-eq%3At-abs), where T1\=S1, T2\=S2 and Γ∪(x:S1)⊢s2:S2: the result is immediate (using [S-Refl](https://kjaer.io/fos/#mjx-eqn-eq%3As-refl) to get T1<:S1 from T1\=S1).
+*   Case [T-Sub](https://kjaer.io/fos/#mjx-eqn-eq%3At-sub), Γ⊢λx:X1. s2:U and U<:T1→T2
+    
+    By the [inversion lemma for subtyping](https://kjaer.io/fos/#inversion-lemma-for-subtyping), we have U\=U1→U2, with T1<:U1 and U2<:T2.
+    
+    By the IH, we then have U1<:S1 and Γ∪(x:S1)⊢s2:U2.
+    
+    We can apply [S-Trans](https://kjaer.io/fos/#mjx-eqn-eq%3As-trans) to U1<:S1 and T1<:U1 to get T1<:S1.
+    
+    We can apply [T-Sub](https://kjaer.io/fos/#mjx-eqn-eq%3At-sub) to the assumptions that Γ∪(x:S1)⊢s2:U2 and U2<:T2 to conclude Γ∪(x:S1)⊢s2:T2
+    
+
+#### Preservation
+
+Remember that preservation states that if Γ⊢t:T and t⟶t′ then Γ⊢t′:T.
+
+The proof is by induction on typing derivations:
+
+*   Case [T-Sub](https://kjaer.io/fos/#mjx-eqn-eq%3At-sub): t:S and S<:T.
+    
+    By the IH, Γ⊢t′:S.
+    
+    By [T-Sub](https://kjaer.io/fos/#mjx-eqn-eq%3At-sub), Γ⊢t:T.
+    
+*   Case [T-App](https://kjaer.io/fos/#mjx-eqn-eq%3At-app): t\=t1 t2, Γ⊢t1:T11→T12, Γ⊢t2:T11 and T\=T12. By the inversion lemma for evaluation[3](https://kjaer.io/fos/#fn:inversion-lemma-evaluation-lambda), there are three rules by which t⟶t′ can be derived:
+    
+    *   Subcase [E-App1](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-app1): t1⟶t′1 and t′\=t′1 t2. The result follows from the IH and [T-App](https://kjaer.io/fos/#mjx-eqn-eq%3At-app)
+    *   Subcase [E-App2](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-app2): t1\=v1, t2⟶t′2 and t′\=v1 t′2. The result follows from the IH and [T-App](https://kjaer.io/fos/#mjx-eqn-eq%3At-app)
+    *   Subcase [E-AppAbs](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-appabs): t1\=λx:S11. t12, t2\=v2 and t′\=\[x↦v2\]t12.
+        
+        By the [inversion lemma for typing](https://kjaer.io/fos/#inversion-lemma-for-typing), T11<:S11 and Γ∪(x:S11)⊢t12:T12.
+        
+        By [T-Sub](https://kjaer.io/fos/#mjx-eqn-eq%3At-sub), Γ⊢t2:S11
+        
+        By the [substitution lemma](https://kjaer.io/fos/#substitution-lemma), Γ⊢t′:T12.
+        
+
+### Subtyping features
+
+#### Casting
+
+In languages like Java and C++, ascription is a little more interesting than [what we previously defined it as](https://kjaer.io/fos/#ascription). In these languages, ascription serves as a casting operator.
+
+\frac{Γ⊢t1:S}{Γ⊢t1 as T:T}	(T-Cast)
+\frac{⊢rv1:T}{v1 as T⟶v1}	(E-Cast)
+
+Contrary to [T-Ascribe](https://kjaer.io/fos/#mjx-eqn-eq%3At-ascribe), the [T-Cast](https://kjaer.io/fos/#mjx-eqn-eq%3At-cast) rule allows the ascription to be of a different type than the term. This allows the programmer to have an escape hatch, and get around the type checker. However, this _laissez-faire_ solution means that a run-time check is necessary, as [E-Cast](https://kjaer.io/fos/#mjx-eqn-eq%3Ae-cast) shows.
+
+#### Variants
+
+The subtyping rules for [variants](https://kjaer.io/fos/#variants) are almost identical to those of records, with the main difference being the width rule allows variants to be _added_, not dropped:
+
+⟨li:T_i^{i∈1…n}⟩<:⟨l_i:T_i^{i∈1…n+k}⟩	(S-VariantWidth)
+\frac{∀i Si<:Ti}{⟨l1:S_i^{i∈1…n}⟩<:⟨l1:T_i^{i∈1…n}⟩}	(S-VariantDepth)
+\frac{⟨kj:S_j^{j∈1…n}⟩ is a permutation of ⟨li:T_i^{i∈1…n}⟩}{⟨k_j:S_j^{j∈1…n}⟩<:⟨li:T_i^{i∈1…n}⟩}	(S-VariantPerm)
+\frac{Γ⊢t1:T1}{Γ⊢⟨l1\=t1⟩:⟨l1:T1⟩}	(T-Variant)
+
+The intuition for [S-VariantWidth](https://kjaer.io/fos/#mjx-eqn-eq%3As-variantwidth) is that a tagged expression ⟨l\=t⟩ belongs to a variant type ⟨li:Tii∈1…n⟩ if the label l is _one of the possible labels_ {li}. This is easy to understand if we consider the [`Option` example that we used previously](https://kjaer.io/fos/#variants): `some` and `none` are subtypes of `Option`.
+
+#### Covariance
+
+`List` is an example of a covariant type constructor: we want `List[None]` to be a subtype of `List[Option]`.
+
+\frac{S1<:T1}{List S1<:List T1}		(S-List)
+
+#### Invariance
+
+References are not covariant nor invariant. An example of an invariant constructor is a [reference](https://kjaer.io/fos/#references).
+
+*   When a reference is _read_, the context expects T1 so giving a S1<:T1 is fine
+*   When a reference is _written_, the context provides a T1. If the the actual type of the reference is Ref S1, someone may later use the T1 as an S1, so we need T1<:S1
+
+Similarly, arrays are invariant, for the same reason:
+
+\frac{S1<:T1	T1<:S1}{Array S1<:Array T1}	(S-Array)
+
+Instead, Java has covariant arrays:
+
+\frac{S1<:T1}{Array S1<:Array T1}	(S-ArrayJava)
+
+This is because the Java language designers felt that they needed to be able to write a sort routine for mutable arrays, and implemented this as a quick fix. Instead, it turned out to be a mistake that even the Java designers regret.
+
+The solution to this invariance problem is based on the following observation: a `Ref T` can be used either for reading or writing. To be able to have contravariant reading and covariant writing, we can split a `Ref T` in three:
+
+*   `Source T`: a reference with read capability
+*   `Sink T`: a reference cell with write capability
+*   `Ref T`: a reference cell with both capabilities
+
+The typing rules then limit dereference to sources, and assignment to sinks:
+
+\frac{Γ∣Σ⊢t1:Source T11}{Γ∣Σ⊢!t1:T11}		(T-DerefSource)
+\frac{Γ∣Σ⊢t1:Sink T11	Γ∣Σ⊢t2:T11}{Γ∣Σ⊢t1:\=t2:Unit}	(T-AssignSink)
+
+The subtyping rules establish sources as covariant constructors, sinks as contravariant, and a reference as a subtype of both:
+
+\frac{S1<:T1}{Source S1<:Source T1}	(S-Source)
+\frac{T1<:S1}{Sink S1<:Sink T1}		(S-Sink)
+Ref T1<:Source T1		(S-RefSource)
+Ref T1<:Sink T1		(S-RefSink)
+
+### Algorithmic subtyping
+
+So far, in STLC, our typing rules were _syntax directed_. This means that for every for every form of a term, a specific rule applied; which rule to choose was always straightforward.
+
+The reason the choice is so straightforward is because we can divide the positions of a typing relation like [T-App](https://kjaer.io/fos/#mjx-eqn-eq%3At-app) into input positions (Γ and t), and output positions (T11, T12).
+
+However, by introducing subtyping, we introduced rules that break this: [T-Sub](https://kjaer.io/fos/#mjx-eqn-eq%3At-sub) and [S-Trans](https://kjaer.io/fos/#mjx-eqn-eq%3As-trans) apply to _any_ kind of term, and can appear at any point of a derivation. Every time our type checking algorithm encounters a term, it must decide which rule to apply. [S-Trans](https://kjaer.io/fos/#mjx-eqn-eq%3As-trans) also introduces the problem of having to pick an intermediary type U (which is neither an input nor an output position), for which there can be multiple choices. [S-Refl](https://kjaer.io/fos/#mjx-eqn-eq%3As-refl) also overlaps with the conclusions of other rules, although this is a less severe problem.
+
+But this excess flexibility isn’t strictly needed; we don’t need 1000 ways to prove a given typing or subtyping statement, one is enough. The solution to these problems is to replace the ordinary, _declarative_ typing and subtyping relations with _algorithmic_ relations, whose sets of rules are syntax directed. This implies proving that the algorithmic relations are equivalent to the original ones, that subsumption, transitivity and reflexivity are consequences of our algorithmic rules.
+
+Objects
+-------
+
+For simple objects and classes, we can easily use a translational analysis, converting ideas like dynamic dispatch, state, inheritance, into derived forms from lambda calculus such as (higher-order) functions, records, references, recursion, subtyping. However, for more complex features (like `this`), we’ll need a more direct treatment.
+
+In this section, we’ll just identify the core features of object-oriented programming, and propose translations for the simpler features. The more complex features will lead us to defining Featherweight Java.
+
+### Classes
+
+Let’s take a look at an example of a class:
+
+```
+    class Counter {
+        protected int x = 1;
+        int get() { return x; }
+        void inc() { x++; }
+    }
+```
+    
+
+To represent this in lambda calculus, we could use a record in a let body:
+
+    
+```
+ 
+    let x = ref 1 in {
+        get = λ_: Unit. !x
+        inc = λ_: Unit. x := succ(!x)
+    }
+```
+    
+
+More generally, the state may consist of more than a single reference cell, so we can let the state be represented by a variable `r` corresponding to a record with (potentially) multiple fields.
+
+    
+```
+
+    let r = {x = ref 1} in {
+        get = λ_: Unit. !(r.x)
+        inc = λ_: Unit. r.x := succ(!(r.x))
+    }
+```
+
+    
+
+### Object generators
+
+To create a new object, we can just define a function that creates and returns a `Counter`:
+
+    
+```
+ 
+    newCounter = λ_: Unit. 
+        let r = {x = ref 1} in {
+            get = λ_: Unit. !(r.x)
+            inc = λ_: Unit. r.x := succ(!(r.x))
+        }
+ ```
+   
+    
+
+This returns a `newCounter` object of type Unit→Counter, where the Counter type is defined as:
+
+Counter\={get:Unit→Nat, inc:Unit→Unit}
+
+### Dynamic dispatch
+
+When an operation is invoked on an object, the ensuing behavior depends on the object itself; indeed, two object of the same type may be implemented internally in completely different ways.
+
+For instance, we can define two subclasses doing very different things:
+
+    
+```
+ class A {
+        int x = 0;
+        int m() {
+            x = x + 1;
+            return x;
+        }
+    }
+    
+    class B extends A {
+        int m() {
+            x = x + 5;
+            return x;
+        }
+    }
+    
+    class C extends A {
+        int m() {
+            x = x - 10;
+            return x;
+        }
+    }
+```
+
+    
+
+Here, `(new B()).m()` and `(new C()).m()` have different results.
+
+Dynamic dispatch is a kind of _late binding_ for function calls. Rather than construct the binding from call to function at compile-time, the idea in dynamic dispatch is to bind at runtime.
+
+### Encapsulation
+
+In most OO languages, each object consists of some internal state. The state is directly accessible to the methods, but inaccessible from the outside.In Java, the encapsulation can be enabled with `protected`, which allows for a sort of information hiding.
+
+The type of an object is just the set of operations that can be performed on it. It doesn’t include the internal state.
+
+### Inheritance and subtyping
+
+Subtyping is a way to talk about types. Inheritance is more focused on the idea of sharing behavior, on avoiding duplication of code.
+
+The basic mechanism of inheritance is classes, which can be:
+
+*   **instantiated** to create new objects (“instances”), _or_
+*   **refined** to create new classes (“subclasses”). Subclasses are subtypes of their parent classes.
+
+When we refine a class, it’s usually to add methods to it. We saw previously that a record A with more fields than B is a subtype of B; let’s try to extend that behavior to objects.
+
+As an example, let’s try to look at a `ResetCounter` inheriting from `Counter`, adding a `reset` method that sets `x` to 1. In Java, we’d do this as follows:
+
+```
+ 
+    class Counter {
+        protected int x = 1;
+        int get() {
+            return x;
+        }
+        void increment() {
+            x++;
+        }
+    }
+    
+    class ResetCounter extends Counter {
+        void reset() {
+            x = 1;
+        }
+    }
+    
+```
+
+
+How can we implement `ResetCounter` in lambda calculus? Initially, we can just try to do this by coping the `Counter` body into a new object `ResetCounter`, and add a `reset` method:
+
+```
+   
+    newResetCounter =
+        λ_: Unit. let r = {x = ref 1} in {
+            get   = λ_: Unit. !(r.x),
+            inc   = λ_: Unit. r.x := succ(!(r.x)),
+            reset = λ_: Unit. r.x := 1
+        }
+    
+```
+
+
+But this goes against the [DRY principle](https://en.wikipedia.org/wiki/Don%27t_repeat_yourself) from software engineering.
+
+Another thing that we could try is to take a `Counter` as an argument in the `ResetCounter` object generator:
+
+    
+```
+
+    resetCounterFromCounter = λc. Counter. 
+        let r = {x = ref 1} in {
+            get   = c.get,
+            inc   = c.inc,
+            reset = λ_: Unit. r.x := 1
+        }
+    
+```
+
+
+However, this is problematic because we’re not sharing the state; we’ve got two separate counts in `Counter` and `ResetCounter`, and they cannot access each other’s state.
+
+To solve this, we must separate the method definition from the object generator. To do this, we can use the age-old computer science adage of “every problem can be solved with an additional level of indirection”.
+
+    
+```
+
+    counterClass = λr: CounterState. {
+        get = λ_: Unit. !(r.x),
+        inc = λ_: Unit. r.x := succ(!(r.x))
+    };
+    
+    newCounter = λ_: Unit. 
+        let r = {x = ref 1} in counterClass r;
+```
+    
+
+To define the subclass, we’ll first have to introduce the notion of `super`. We know this construct from Java, among others. Java’s `super` gives us a mechanism to avoid dynamic dispatch, since we _specifically_ call the method in the superclass we inherit from.
+
+For the subclass, the idea is to instantiate the `super`, and bind the methods of the object to the `super`’s methods. The classes both have access to the same value through the use of references.
+
+    
+```
+
+    resetCounterClass = λr: CounterState.
+        let super = counterClass r in {
+            get   = super.get,
+            inc   = super.inc,
+            reset = λ_: Unit. r.x := 1
+        };
+    
+    newResetCounter = λ_: Unit.
+        let r = {x = ref 1} in resetCounterClass r;
+    
+```
+
+
+This also allows us to call `super` in added or redefined methods (so `reset` could call `super.inc` if it needed to, or we could redefine `inc` to add functionality around `super.inc`).
+
+Our state record `r` can even contain more variable than the superclass needs, as records with more fields are subtypes of those with a subset of fields. This allows us to have more instance variables in the subclass.
+
+Note that if we wanted to be more rigorous, we’d have to define this more precisely. In STLC, we’ve defined records through _structural subtyping_. But most object-oriented languages use _nominal subtyping_, where things aren’t subtypes of each other just because they have the same methods, but because we declare them to be so. We’ll see [more on this later](https://kjaer.io/fos/#structural-vs-nominal-type-systems).
+
+### This
+
+Above, we saw how to call methods from the parent class through `super`. To call methods between each other, we need to add `this`.
+
+Let’s consider the following class as an example:
+
+    
+```
+ 
+    class SetCounter {
+        protected int x = 0;
+        int get() {
+            return x;
+        }
+        void set(int i) {
+            x = i
+        }
+        void inc() {
+            this.set(this.get() + 1);
+        }
+    }
+    
+```
+
+This example may be a little simplistic, but in practice, it’s very useful to be able to use other methods within the same class.
+
+In an initial attempt at implementing this in lambda calculus, we can add a fix operator to the class definition, so that we can call ourselves:
+
+    
+```
+ 
+    setCounterClass = λr: CounterState. 
+        fix (λthis: SetCounter. {
+            get = λ_: Unit. !(r.x),
+            set = λi: Nat.  r.x := i,
+            int = λ_: Unit. this.set (succ (this.get unit))
+        });
+```
+
+    
+
+As a small sanity check, we pass a SetCounter⟶SetCounter type to `fix` operation, so the resulting type is indeed SetCounter.
+
+We have “tied the knot” by using the `fix` operator, which arranges for the very record we built to also be passed as `this`.
+
+But this does not model the behavior of `this` in most object-oriented languages, which support a more general form of recursive call between methods, known as _open recursion_. This allows the methods of a superclass to call the methods of a subclass through `this`.
+
+The problem here is that the fixed point operation is “closed”: it only gives us the exact set we built in `this`, and isn’t open to extension. To solve this, we can move the application of `fix` from the class definition to the object creation function (essentially switching the order of `fix` and `λr: CounterState`):
+
+    
+```
+
+    setCounterClass = λr: CounterState. 
+        λthis: SetCounter. {
+            get = λ_: Unit. !(r.x),
+            set = λi: Nat.  r.x := i,
+            int = λ_: Unit. this.set (succ (this.get unit))
+        };
+    
+    newSetCounter = λ_: Unit.
+        let r = {x = ref 1} in fix (setCounterClass r);
+    
+```
+
+Note that this changes the type signature of the class, which goes from:
+
+SetCounterClass:CounterState⟶SetCounter
+
+To the following:
+
+SetCounterClass:CounterState⟶SetCounter⟶SetCounter
+
+But passing it the state, and passing that to `fix` does indeed give us a SetCounter type, so our constructor returns the expected type.
+
+### Using `this`
+
+Let’s continue the example from above by defining a new class of counter object, keeping count of the number of times `set` has been called. We’ll call this an “instrumented counter” `InstrCounter`, extending the `SetCounter` we defined above:
+
+    
+```
+
+    InstrCounter = {
+        get: Unit -> Nat,
+        set: Nat  -> Unit,
+        inc: Unit -> Unit
+        accesses: Unit -> Nat
+    };
+    
+    IntrCounterState = {
+        x: Ref Nat,
+        a: Ref Nat
+    };
+    
+    instrCounterClass = λr: InstrCounterState. λthis: InstrCounter.
+        let super = setCounterClass r this in {
+            get = super.get,
+            set = λi: Nat. (
+                r.a := succ(!(r.a));
+                super.set i
+            ),
+            inc = super.inc,
+            accesses = λ_: Unit. !(r.a)
+        };
+    
+    newInstrCounter = λ_: Unit. 
+        let r = {x = ref 1, a = ref 0} in fix (instrCounterClass r);
+    
+```
+
+
+A few notes about this implementation:
+
+*   The methods use `this` (passed as a parameter) and `super` (constructed using `this` and the state variable `r`)
+*   Because we allow for open recursion, the `inc` in `super` calls the `set` defined here, which calls the `super.set`
+
+But this implementation is not very useful, as the object creator diverges! Intuitively, the problem is that the “unprotected” use of `this`. The argument that we pass to `fix` uses its own argument (`this`) too early; in general, to create fixed points abstractions that don’t diverge, the assumption is that one should only use the argument in “protected” locations, such as in the bodies of inner lambda abstractions.
+
+A solution is to “delay” this by putting a dummy abstraction in front of it:
+
+    
+```
+
+    setCounterClass = λr: CounterState. 
+        λthis: Unit -> SetCounter.
+            λ_: Unit. {
+                get = λ_: Unit. !(r.x),
+                set = λi: Nat.  r.x := i,
+                int = λ_: Unit. this.set (succ (this.get unit))
+            };
+```
+
+    
+
+This essentially replaces call-by-value with call-by-name. Now, `this` is of type Unit→SetCounter.
+
+This works, but very slowly. All the delaying we added has a side effect. Instead of computing the method table just once, we now re-compute it every time we invoke a method. Indeed, every time we need it, since we’re in call-by-name, we re-compute it every time.
+
+The solution here is to use lazy values, which we can represent in lambda calculus as a reference, along with a flag about whether we’ve computed it or not. Section 18.12 describes this in more detail.
+
+Featherweight Java
+------------------
+
+We’ve now covered the essence of objects, but there are still certain things missing compared to Java. With objects, we’ve captured the runtime aspect of classes, but we haven’t really talked about the classes as types.
+
+We’re also missing a discussion on:
+
+*   Named types with declared subtyping (we’ve only done structural subtyping)
+*   Recursive types, like the ones we need for list tails, for instance
+*   Run-time type analysis: most type systems have escape hatches known as casts, which we haven’t talked about
+*   Many other things
+
+Seeing that we have plenty to talk about, let’s try to define a model for Java. A model always abstracts details away, so there’s no such thing as a perfect model. It’s always a question of which trade-offs we choose for our specific use-case.
+
+Java is used for a lot of different purposes, so we are going to have lots of different models. For instance, some of the choices we need to make are:
+
+*   Source-level vs. bytecode level
+*   Large (inclusive) vs small (simple) models
+*   Type system vs. run-time
+*   Models of specific features
+
+Featherweight Java was proposed as a tool for analyzing GJ (Java with generics), and has since been used to study proposed Java extensions. It aims to be very simple, modeling just the core OO features and their types, _and nothing else_. It models:
+
+*   Classes and objects,
+*   Method and method invocation,
+*   Fields and field access,
+*   Inheritance (including open recursion through `this`)
+*   Casting
+
+It leaves out more complex topics such as reflection, concurrency, exceptions, loops, assignment (!) and overloading.
+
+The model aims to be very explicit, and simple. To maintain this simplicity, it imposes some conventions:
+
+*   Every class must declare a superclass
+*   All classes must have a constructor
+*   All fields must be represented 1-to-1 in the constructor
+    *   It takes the same number of parameters of fields of the class
+    *   It assigns constructor parameters to local fields
+    *   Calls `super` constructor to assign remaining fields
+    *   Nothing else!
+*   The constructor must call `super()`
+*   Always explicitly name receiver object in method invocation or field access (using `this.x` or `that.x`)
+*   Methods are just a single `return` expression
+
+### Structural vs. Nominal type systems
+
+There’s a big dichotomy in the world of programming languages.
+
+On one hand, we have _structural_ type systems, where the names are convenient but inessential abbreviations of types. What really matters about a type in a structural type system is its structure. It’s somewhat cleaner and more elegant, easier to extend, but once we need to talk about recursive types, some of the elegance falls away. Examples include Haskell, Go and TypeScript.
+
+On the other hand, what’s used in almost all mainstream programming languages is _nominal_ type systems. Here, recursive types are much simpler, and using names everywhere makes type checking much simpler. Having named types is also useful at run-time for casting, type testing, reflection, etc. Examples include Java, C++, C# and Kotlin.
+
+### Representing objects
+
+How can we represent an object? What defines it? Two objects are different if their constructors are different, or if their constructors have been passed different arguments. This observation leads us to the idea that we can identify an object fully by looking at the `new` expression. Here, having omitted assignments makes our life much easier.
+
+### Syntax
+
+The syntax of Featherweight Java is:
+
+t::\=	terms
+x	variable
+t.f	field access
+t.m(¯t)	method invocation
+new C(¯t)	object creation
+(C)t	cast
+
+v::\=	values
+new C(¯v)	object creation
+
+K::\=	constructor declarations
+C(¯C ¯f) {super(¯f); this.¯f\=¯f;}
+
+M::\=	method declarations
+C m(¯C ¯x){return t;}
+
+CL::\=	class declarations
+class C extends C {¯C ¯f; K ¯M}
+
+Above and in the following, we use the following metavariables:
+
+*   A, B, C, D, E for class names
+*   f, g for field names
+*   x for parameter names
+*   s, t for terms
+*   u, v for values
+*   K for constructor declarations
+*   M for method declarations
+
+We’ll use the notation ¯C to mean arbitrary repetition C1,…,Cn of C, and similarly for ¯f,¯x,¯t, etc. For method declaration, ¯M means M1…Mn (no commas).
+
+The notation ¯C ¯f means we’ve “zipped” the two together: C1 f1,…,Cn fn.
+
+Similarly, this.¯f\=¯f means this.f1\=f1;…;this.fn\=fn
+
+### Subtyping
+
+Java is a nominal type system, so subtyping in FJ is _declared_. This means that in addition to two properties for reflexion and transitivity, the subtyping relationship is given by the declared superclass.
+
+C<:C
+\frac{C<:D	D<:E}{C<:E}
+\frac{CT(C)\=class C extends D{…}}{C<:D}
+
+We assume to have a _class table_ CT, mapping class names to their definition.
+
+### Auxiliary definitions
+
+We can glean a lot of useful properties from the definition in the class table, so it’ll come in handy for evaluation and typing.
+
+We said earlier that every class needed to define a superclass, but what about `Object`? The simplest way to deal with this is to let `Object` be an exception, a distinguished class name whose definition does not appear in the class table.
+
+The fields of a class C, written fields(C) is the sequence ¯C ¯f mapping the class to each field. The fields of a class are those defined within it, and those it inherits from the superclasses:
+
+fields(Object)\=∅
+\frac{CT(C)\=class C extends D{¯C ¯f;K ¯M},fields(D)\=¯D¯g}{fields(C)\=¯D ¯g,¯C ¯f}
+
+The type of a method m, written mtype(m,C) is a pair ¯B→B mapping argument types ¯B to a result type B by searching up the chain of superclasses until we find the definition of the method m:
+
+\frac{CT(C)\=class C extends D {¯C ¯f;K ¯M},B m(¯B ¯x) {return t;}∈¯M}{mtype(m,C)\=¯B→B}
+\frac{CT(C)\=class C extends D {¯C ¯f;K ¯M},m is not defined in ¯M}{mtype(m,C)\=mtype(m,D)}
+
+Method body lookups work in basically the same way. It returns a pair (¯x,t) of parameters ¯x and a term t by searching up the chain of superclasses:
+
+\frac{CT(C)\=class C extends D {¯C ¯f;K ¯M},B m(¯B ¯x) {return t;}∈¯M}{mbody(m,C)\=(¯x,t)}
+\frac{CT(C)\=class C extends D {¯C ¯f;K ¯M},m is not defined in ¯M}{mbody(m,C)\=mbody(m,D)}
+
+Featherweight Java also models overriding, so we can define a predicate function override(m,D,¯C→C0) that checks whether the method m with argument types ¯C and result type C0 is overridden in a subclass of D:
+
+\frac{mtype(m,D)\=¯D→D0⟹¯C\=¯D∧C0\=D0}{override(m,D,¯C→C0)}
+
+### Evaluation
+
+FJ has three computation rules for field access, method invocation and casting.
+
+\frac{fields(C)\=¯C ¯f}{(new C(¯v)).fi⟶vi}	(E-ProjNew)
+\frac{mbody(m,C)\=(¯x,t0)}{(new C(¯v)).m(¯u)⟶\[¯x↦¯u,this↦new C(¯v)\]t0}	(E-InvkNew)
+\frac{C<:D}{(D) (new C(¯v))⟶new C(¯v)}		(E-CastNew)
+
+It also has a bunch of congruence rules:
+
+\frac{t0⟶t′0}{t0.f⟶t′0.f}		(E-Field)
+\frac{t0⟶t′0}{t0.m(¯t)⟶t′0.m(¯t)}	(E-Invk-Recv)
+\frac{ti⟶t′i}{v0.m(¯v,ti,¯t)⟶v0.m(¯v,t′i,¯t)}	(E-Invk-Arg)
+\frac{ti⟶t′i}{new C(¯v,ti,¯t)⟶new C(¯v,t′i,¯t)}	(E-New-Arg)
+\frac{t0⟶t′0}{(C) t0⟶(C) t′0}		(E-Cast)
+
+As [E-InvkNew](https://kjaer.io/fos/#mjx-eqn-eq%3Afj-e-invknew) and [E-Invk-Arg](https://kjaer.io/fos/#mjx-eqn-eq%3Afj-e-invk-arg) show, it uses call-by-value evaluation order.
+
+### Typing
+
+\frac{x:C∈Γ}{Γ⊢x:C}	(T-Var)
+\frac{Γ⊢t0:C0fields(C0)\=¯C ¯f}{Γ⊢t0.fi:Ci}	(T-Field)
+\frac{Γ⊢t0:C0mtype(m,C0)\=¯D→CΓ⊢¯t:¯C¯C<:¯D}{Γ⊢t0.m(¯t):C}	(T-Invk)
+\frac{fields(C)\=¯D ¯fΓ⊢¯t:¯C¯C<:¯D}{Γ⊢new C(¯t):C}	(T-New)
+\frac{Γ⊢t0:DD<:C}{Γ⊢(C) t0:C}	(T-UCast)
+\frac{Γ⊢t0:DC<:DC≠D}{Γ⊢(C) t0:C}	(T-DCast)
+(¯x:¯C)∪(this:C)⊢t0:E0	E0<:C0	
+\frac{CT(C)\=class C extends D {…}override(m,D,¯C→C0)}{C0 m (¯C ¯x) {return t0;} OK in C}
+K\=C(¯D ¯g,¯C ¯f) {super(¯g);this.¯f\=¯f;}	(M OK in C)
+\frac{fields(D)\=¯D ¯g¯M OK in C}{class C extends D {¯C ¯f;K ¯M} OK}	(C OK)
+
+[T-Var](https://kjaer.io/fos/#mjx-eqn-eq%3Afj-t-var) is as usual. [T-Field](https://kjaer.io/fos/#mjx-eqn-eq%3Afj-t-field) says that we can type-check the ith field by looking up the type of the ith field in the class.
+
+We have two rules for casting: one for subtypes ([T-DCast](https://kjaer.io/fos/#mjx-eqn-eq%3Afj-t-dcast)), and one for supertypes ([T-UCast](https://kjaer.io/fos/#mjx-eqn-eq%3Afj-t-ucast)). We do not allow casting to an unrelated type, because FJ complies with Java, and Java doesn’t allow it.
+
+For methods and classes, we want to make sure that overrides are valid, that we pass the correct arguments to the superclass constructor.
+
+Also note that the our typing rules often have subsumption built into them (e.g. see [T-Invk](https://kjaer.io/fos/#mjx-eqn-eq%3Afj-t-invk)), instead of having a separate subsumption rule. This allows us to have algorithmic subtyping, which we need for two reasons:
+
+1.  To perform static overloading resolution (picking between different overloaded methods at compile-time), we need to be able to speak about the type of an expression (and we need one single type, not several of them)
+2.  We’d run into trouble typing conditional expressions. This is not something that we have included in FJ, but regular Java has it, and we may wish to include it as an extension to FJ
+
+Let’s talk about this problem with conditionals (aka ternary expressions) in a little more detail. If we have a conditional t1? t2:t3, with t1:Bool, t2:T2 and t3:T3, what is the return type of the expression? The simple solution is the least common supertype (this corresponds to the lowest common ancestor), but that becomes problematic with interfaces, which allow for multiple inheritance (for instance, if T2 and T3 both implement I2 and I3, we wouldn’t know which one to pick).
+
+The actual Java rule that’s used is that the return type is min(T2,T3). Scala solves this (in Dotty) with union types, where the result type is T2∣T3.
+
+### Evaluation context
+
+We can’t actually prove progress, as well-typed programs can get stuck because of casting. Casting can fail, and we’d get stuck. The solution is to weaken the statement of progress:
+
+**FJ progress** (_informally_): a well-typed FJ term is either value, reduces to one, or gets stuck at a cast failure.
+
+To formalize this, we need a little more work. We’ll first need to introduce **evaluation contexts**. For FJ, the evaluation context is defined as:
+
+E::\=		evaluation contexts
+\[\]		hole
+E.f		field access
+E.m(¯t)		method invocation (rcv)
+v.m(¯v,E,¯t)	method invocation (arg)
+new C(¯v,E,¯t)	object creation (arg)
+(C) E		cast
+
+All expressions in E are recursive, except for \[\]; this means an expression is a nested composition of the above forms, with a hole somewhere inside it. We write E\[t\] for the term obtained by replacing the hole in E with t.
+
+Evaluation contexts are essentially just shorthand notation to avoid the verbosity of congruence rules. Usually, congruence rules just “forward” the computation to some part of the expression, and that’s exactly what we capture with evaluation contexts: the position of \[\] tells us which part of the expression to evaluate.
+
+Having defined the execution context, we can then express all congruence rules as a single rule:
+
+\frac{t⟶t′}{E\[t\]⟶E\[t′\]}
+
+### Properties
+
+#### Progress
+
+We can now restate progress more formally.
+
+**FJ progress**: Suppose t is a closed, well-typed normal form. Then either:
+
+1.  t is a value
+2.  t⟶t′ for some t′
+3.  For some evaluation context E, we can express t as t\=E\[(C) (new D(¯v))\], with ¬(D<:C)
+
+#### Preservation
+
+The preservation theorem can be stated as:
+
+**Preservation**: If Γ⊢t:C and t⟶t′ then Γ⊢t′:C′ for some C′<:C
+
+But this doesn’t actually for FJ. Because we allow casts to go up and down, we can upcast to Object before downcasting to another, unrelated type. Because FJ must model Java, we need to actually introduce a rule for this. In this new rule, we give a “stupid warning” to indicate that the _implementation_ should generate a warning if this rule is used:
+
+\Γ⊢t0:D	¬(C<:D)¬(D<:C)
+frac{stupid warning}{Γ⊢(C)t0:C}		(T-SCast)
+
+#### Correspondence with Java
+
+FJ corresponds to Java; by this, we mean:
+
+1.  Every syntactically well-formed FJ program is also a syntactically well-formed Java program.
+2.  A syntactically well-formed FJ program is typable in FJ (without using [T-SCast](https://kjaer.io/fos/#mjx-eqn-eq%3Afj-t-scast)) ⟺ it is typable in Java
+3.  A well-typed FJ program behaves the same in FJ as in Java (e.g. diverges in FJ ⟺ it diverges in Java)
+
+Without a formalization of full Java, we cannot _prove_ this, but it’s still useful to say what we’re trying to accomplish, as it provides us with a rigorous way of judging potential counterexamples.
+
+Foundations of Scala
+--------------------
+
+### Modeling lists
+
+If we’d like to apply everything we’ve learned so far to model Scala, we’ll run into problems fairly quickly. Say we’d like to model a `List`.
+
+    
+```
+    trait List[+T] {
+        def isEmpty: Boolean
+        def head: T
+        def tail: List[T]
+    }
+    
+    def Const[T](hd: T, tl: List[T]) = new List[T] {
+        def isEmpty = false
+        def head = hd
+        def tail = tl
+    }
+    
+    def Nil[T] = new List[T] {
+        def isEmpty = true
+        def head = ???
+        def tail = ???
+    } 
+```
+
+Immediately, we run into these problems:
+
+*   It’s parameterized
+*   It’s recursive
+*   It can be invariant or covariant
+
+To solve the parametrization, we need a way to express type constructors. Traditionally, the solution is to express this as _higher-kinded types_.
+
+    
+```
+    *            // Kind of normal types (Boolean, Int, ...)
+    * -> *       // Kind of unary type constructor: 
+                 // something that takes a type, returns one
+    * -> * -> *  // and so on...
+    ...
+```
+
+    
+
+We’ve previously had abstraction and application for terms, but we’d now like to extends this to types. We’ll introduce μ, which works like λ but for types.
+
+This also leads us to solving the problem of modeling recursive types, as we can now create type-level functions, called _type operators_. For instance, we can define a constructor for recursive types μt.T(t). For instance:
+
+    
+```
+
+    mu ListInt. { head: Int, tail: ListInt }
+```
+
+    
+
+However, we get into some tricky questions when it comes to equality and subtyping. For instance, in the following, how do `T` and `Int -> T` relate?
+
+    
+```
+    type T = mu t. Int -> Int -> t
+```
+    
+
+Finally, we need to model the covariance of lists. We can deal with variance by expressing definition site variance as use-site variance, using Java wildcards:
+
+    
+```
+
+    // We can go from definition site variance...
+    trait List[+T] { ... }
+    trait Function1[-T, +U] { ... }
+    
+    List[C]
+    Function1[D, E]
+    
+    // ... to use-site variance by rewriting with Java wildcards:
+    trait List[T] { ... }
+    trait Function1[T, U]
+    
+    List[_ <: C]
+    Function1[_ >: D, _ <: E]
+```
+    
+
+Here, we should understand `Function1[_ >: D, _ <: E]` as the type of functions from some (unknown) supertpye of `D` to some (unknown) subtype of `E`. How can we model this? One possibility is existential types:
+
+```
+    
+    // Scala:
+    Function1[X, Y] forSome {
+        type X >: D
+        type Y <: E
+    }
+    
+    // more traditional notation, with existential types:
+    ∃ X >: D, Y <: E. Function1[X, Y]
+```
+    
+
+But this gets messy rather quickly. Can we find a nicer way of expressing this? As we saw above, Scala has type members, so we can re-formulate `List` as follows:
+
+    
+```
+
+    trait List { self => 
+        type T
+        def isEmpty: Boolean
+        def head: T
+        def tail: List { type T <: self.T } // refinement handling co-variance
+    }
+    
+    def Cons[X](hd: X, tl: List { type T <: X }) = new List {
+        type T = X
+        def isEmpty = false
+        def head = hd
+        def tail = tl
+    }
+    
+    // analogous for Nil
+```
+
+    
+
+This offers an alternative way to express the above, without using existential types, but instead using:
+
+*   Variables, functions
+*   Abstract types `type T <: B`
+*   Refinements `List { ... }`
+*   Path-dependent types `self.T`
+
+### Abstract types
+
+Abstract types are types without a concrete implementation. They may have an upper and/or lower bound, like `type L >: T <: U`, or no bounds like below:
+
+    
+```
+
+    // Trait containing an abstract type:
+    trait KeyGen {
+        type Key
+        def key(s: String): this.Key
+    }
+    
+    // Implementation refining the abstract type:
+    object HashKeyGen extends KeyGen {
+        type Key = Int
+        def key(s: String) = s.hashCode
+    }
+    
+```
+
+We can reference the `Key` type of a term `k` as `k.Key`. This is a _path-dependent_ type. For instance:
+
+```
+
+    def mapKeys(k: KeyGen, ss: List[String]): List[k.Key] = 
+        ss.map(s => k.key(s))
+```
+    
+
+The function `mapKeys` has a _dependent function type_. This is an interesting type, because the result type has an internal dependency: `(k: KeyGen, ss: List[String]) -> List[k.Key]`.
+
+In Scala 2, we can’t express this directly; we’d have to go through a trait with an apply method, meaning that we have to define a type for every dependent function:
+
+    
+```
+
+    trait KeyFun {
+        def apply(k: KeyGen, ss: List[String]): List[k.Key]
+    }
+    
+    mapKeys = new KeyFun {
+        def apply(k: KeyGen, ss: List[String]): List[k.Key] = 
+            ss.map(s => k.key(s))
+    }
+    
+```
+
+
+However, Scala 3 (dotty) [introduces these dependent function types](http://dotty.epfl.ch/docs/reference/new-types/dependent-function-types.html) at the language level; it’s done with a similar trick to what we just saw.
+
+In dotty, the intention was to have everything map to a simple object type; this has been formalized in a calculus called DOT, (path-)Dependent Object Types.
+
+### DOT
+
+The DOT syntax is described in the [DOT paper](http://lampwww.epfl.ch/~amin/dot/fool.pdf).
+
+| Symbol | Representation | Description |
+|--------|----------------|-------------|
+| **Types** | | |
+| `S, T, U` | `::=` | `T \| ⊥ \| {a : T} \| {A : S..T} \| x.A \| S ∧ T \| μ(x : T) \| ∀(x : S)T` |
+| | `T` | top type |
+| | `⊥` | bottom type |
+| | `{a : T}` | field declaration |
+| | `{A : S..T}` | type declaration |
+| | `x.A` | type projection |
+| | `S ∧ T` | intersection type |
+| | `μ(x : T)` | recursive type |
+| | `∀(x : S)T` | dependent function |
+| **Values** | | |
+| `v` | `::=` | `ν(x : T)d \| λ(x : T)t` |
+| | `ν(x : T)d` | object |
+| | `λ(x : T)t` | lambda |
+| **Terms** | | |
+| `s, t, u` | `::=` | `x \| v \| x.a \| x y \| let x = t in u` |
+| | `x` | variable |
+| | `v` | value |
+| | `x.a` | selection |
+| | `x y` | application |
+| | `let x = t in u` | let |
+| **Definitions** | | |
+| `d` | `::=` | `{a = t} \| {A = T} \| d1 ∧ d2` |
+| | `{a = t}` | field definition |
+| | `{A = T}` | type definition |
+| | `d1 ∧ d2` | aggregate definition |
+We use the following metavariables:
+
+*   x, y, z for variables
+*   a, b, c for term members
+*   A, B, C for type members
+
+Types are in uppercase, terms in lowercase. Note that recursive types μ(x:T) are a little different from what we’ve talked about, but we’ll get to that later.
+
+As a small technicality, DOT imposes the restriction of only allowing member selection and application on variables, and not on values or full terms. This is equivalent, because we could just assign the value to a variable before selection or application. This way of writing programs is also called _administrative normal form_ (ANF).
+
+To simplify things, we can introduce a programmer-friendly notation with ASCII versions of DOT constructs:
+
+    
+```
+    (x: T) => U          for   λ(x : T)U
+    (x: T) -> U          for   ∀(x : T)U
+    new(x: T)d           or
+    new { x: T => d }    for   ν(x : T)d
+    rec(x: T)            or
+    { x => T }           for   μ(x: T)
+    T & U                for   T ∧ U
+    Any                  for   ⊤
+    Nothing              for   ⊥
+    { type A >: S <: T } for   {A: S..T}
+    { def a = t }        for   {a = t}
+    { type A = T }       for   {A = T}
+```
+
+    
+
+This calculus does not have generic types, because we can encode them as dependent function types.
+
+#### Example 1: Twice
+
+Let’s take a look at an example. The polymorphic type of the `twice` method (which we [defined previously](https://kjaer.io/fos/#lambda-calculus)) is:
+
+∀X. (X→X)→X→X
+
+In other words, it takes a function from X to X, an argument of type X, and returns a value of type X, where X is some generic type. This is represented as:
+
+    
+```
+
+    (cX: {A: Nothing..Any}) -> (cX.A -> cX.A) -> cX.A -> cX.A
+```
+    
+
+The `cX` parameter is a kind of cell containing a type variance X (hence the name `cX`).
+
+#### Example 2: Church booleans
+
+Let’s see how Church Booleans could be implemented:
+
+    
+```
+ 
+    // Define an abstract "if type" IFT
+    type IFT = { if: (x: {A: Nothing..Any}) -> x.A -> x.A -> x.A }
+    
+    let boolimpl =
+        let boolImpl =
+            new(b: { Boolean: IFT..IFT } &
+                { true: IFT } &
+                { false: IFT })
+            { Boolean = IFT } &
+            { true = { if = (x: {A: Nothing..Any}) => (t: x.A) => (f: x.A) => t } &
+            { false = { if = (x: {A: Nothing..Any}) => (t: x.A) => (f: x.A) => f }
+    in ...
+```
+
+    
+
+We can hide the implementation details of this with a small wrapper to which we apply `boolImpl`.
+
+    
+```
+
+    
+    let bool =
+        let boolWrapper =
+            (x: rec(b: {Boolean: Nothing..IFT} &
+                       {true: b.Boolean} &
+                       {false: b.Boolean})) => x
+        in boolWrapper boolImpl
+```
+    
+
+This is all a little long-winded, so we can introduce some abbreviations:
+
+    
+```
+
+    // Abstract types:
+    type A                   for {A: Nothing..Any}
+    type A = T               for {A: T..T}
+    type A >: S              for {A: S..Any}
+    type A <: U              for {A: Nothing..U}
+    type A >: S <: U         for {A: S..U}
+    
+    // Intersections:
+    { type A = T; a = t }    for {A = T} & {a = t}
+    { type A <: T; a = T }   for {A: Nothing..T} & {a: T}
+    
+    // Ascription:
+    t: T
+    // Which expands to:
+    ((x: T) => x) t
+    // Which expands to:
+    let y = (x: T) => x in
+        let z = t in 
+            y z
+    
+    // Object definition:
+    new { x => d }           for new (x: T)d
+    
+```
+
+With these in place, we can give an abbreviated definition:
+
+    
+```
+
+    let bool =
+        new { b =>
+            type Boolean = {if: (x: { type A }) -> (t: x.A) -> (f: x.A) -> x.A}
+            true = {if: (x: { type A }) => (t: x.A) => (f: x.A) => t}
+            false = {if: (x: { type A }) => (t: x.A) => (f: x.A) => f}
+        }: { b => type Boolean; true: b.Boolean; false: b.Boolean }
+    
+```
+
+
+#### Example 3: Lists
+
+We’ve now introduced all the concepts we need to actually define the covariant list in DOT. We’d like to model the following Scala code in DOT:
+
+    
+```
+
+    
+    package scala.collection.immutable
+    
+    trait List[+A] {
+        def isEmpty: Boolean
+        def head: A
+        def tail: List[A]
+    }
+    
+    object List{
+        def nil: List[Nothing] = new List[Nothing] {
+            def isEmpty = true
+            def head = head // infinite loop
+            def tail = tail // infinite loop
+        }
+    
+        def cons[A](hd: A, tl: List[A]) = new List[A] {
+            def isEmpty = false
+            def head = hd
+            def tail = tl
+        }
+    }
+    
+```
+
+We can write this in DOT as:
+
+    
+```
+
+    let scala_collection_immutable_impl = new { sci =>
+        type List = { thisList =>
+            type A
+            isEmpty: bool.Boolean
+            head: thisList.A
+            tail: sci.List & {type A <: thisList.A }
+        }
+    
+        cons = (x: {type A}) => (hd: x.A) =>
+            (tl: sci.List & { type A <: x.A }) =>
+                let l = new {
+                    type A = x.A
+                    isEmpty = bool.false
+                    head = hd
+                    tail = tl 
+                } in l
+    
+        nil = (x: {type A}) =>
+            let l = new { l =>
+                type A = x.A
+                isEmpty = bool.true
+                head = l.head
+                tail = l.tail
+            } in l
+    }
+    
+```
+
+To hide the implementation, we can wrap `scala_collection_immutable_impl`:
+
+    
+```
+
+    
+    let scala_collection_immutable = scala_collection.immutable_impl: { sci =>
+        type List <: { thisList =>
+            type A
+            isEmpty: bool.Boolean
+            head: thisList.A
+            tail: sci.List & {type A <: thisList.A }
+        }
+    
+        nil: sci.List & { type A = Nothing }
+    
+        cons: (x: {type A}) ->
+              (hd: x.A) ->
+              (tl: sci.List & { type A <: x.A }) ->
+              sci.List & { type A = x.A }
+    }
+    
+```
+
+This concept of hiding the implementation gives us _nominality_. A nominal type such as `List` is simply an abstract type with a hidden implementation. This shows that nominal and structural types aren’t completely separated; we can do nominal types within a structural setting if we have these constructs.
+
+### Evaluation
+
+Evaluation is interesting, because we’d like for it to keep terms in ANF.
+
+First, to define the congruence rules, let’s define an evaluation context E:
+
+E::\=
+\[\]
+let x\=\[\] in t
+let x\=v in E
+
+The rules are then:
+
+\frac{t⟶t′}{E\[t\]⟶E\[t′\]}
+frac{v\=λ(z:T)t}{let x\=v in E\[x y\]⟶let x\=v in E\[\[z↦y\]t\]}
+frac{v\=ν(z:T)...{a\=t}}{let x\=v in E\[x.a\]⟶let x\=v in E\[t\]}
+let x\=y in t⟶\[x↦y\]t
+let x\=(let y\=s in t) in u⟶let y\=s in let x\=t in u
+
+### Type assignment and subtyping
+
+These are in the slides and in the DOT paper.
+
+### Abstract types
+
+Abstract types turn out to be both the most interesting and most difficult part of this, so let’s take a quick look at it before we go on.
+
+Abstract types can be used to encode type parameters (as in `List`), hide information (as in `KeyGen`), and also to resolve some puzzlers like this one:
+
+```
+
+    
+    trait Food
+    trait Grass extends Food
+    
+    trait Animal {
+        def eat(food: Food): Unit
+    }
+    
+    trait Cow extends Animal with Food {
+        // error: does not override Animal.eat because of contravariance
+        def eat(food: Grass): Unit
+    }
+    
+    trait Lion extends Animal {
+        // error: does not override Animal.eat because of contravariance
+        def eat(food: Cow): Unit
+    }
+    
+```
+
+
+Scala disallows this, but Eiffel, Dart and TypeScript and allow it. The trade-off that the latter languages choose is modeling power over soundness, though some languages have eventually come back around and tried to fix this (Dart has a strict mode, Eiffel proposed some data flow analysis, …).
+
+In Scala, this contravariance problem can be solved with abstract types:
+
+```
+
+    trait Animal {
+        type Diet <: Food
+        def eat(food: Diet): Unit
+    }
+    
+    trait Cow extends Animal {
+        type Diet <: Grass
+        def eat(food: this.Diet): Unit
+    }
+    
+    object Milka extends Cow {
+        type Diet = AlpineGrass
+        def eat(food: AlpineGrass): Unit
+    }
+    
+```
+
+### Progress and preservation
+
+Progress is actually wrong. Here’s a counter example:
+
+```
+    t = let x = (y: Bool) => y in x
+    
+```
+
+
+But we can extend our definition of progress. Instead of values, we’ll just want to get answers, which we define as variables, values or let-bindings.
+
+But this is difficult (and it’s what took 8 years to prove), because we always need an inversion, and the subtyping relation is user-definable. This is not a problem for simple type bounds:
+
+```
+
+    type T >: S <: U
+```
+    
+
+But it becomes complex for non-sensical bounds:
+
+```
+
+    type T >: Any <: Nothing
+```
+    
+
+By transitivity, it would mean that `Any <: Nothing`, so by transitivity all types are subtypes of each other. This is bad because it means that inversion fails, as we cannot tell anything from the types anymore.
+
+We might say that this should be easy to disallow in the compiler, but it isn’t. The compiler cannot always tell.
+
+    
+```
+
+    // S and T are both good:
+    type S = { type A; type B >: A <: Bot }
+    type T = { type A >: Top <: B; type B }
+    
+    // But their intersection is bad
+    type S & T == { type A >: Top <: Bot; type B >: Top <: Bot }
+    
+```
+
+
+Bad bounds can arise from intersecting types with good bounds. This isn’t too bad in and of itself, as we could just check all intersection types, written or inferred, for these bad bounds. But there’s a final problem: bad bounds can arise at run-time. By preservation, if Γ⊢t:T and t⟶u then Γ⊢u:T. Because of subsumption, u may also have a type S which is a true subtype of T, and that type S could have bad bounds (from an intersection for instance).
+
+To solve this, the idea is to reason about environments Γ arising from an actual computation in the preservation rule. This environment corresponds to an evaluated `let` binding, binding variables to values. Values are guaranteed to have good bounds because all type members are aliases.
+
+In other words, the `let` prefix acts like a store, a set of bindings x\=v of variables to values. Evaluation will then relate terms _and_ stores:
+
+s∣t⟶s′∣t′
+
+For the theorems of proofs and preservation, we need to relate environment and store. We’ll introduce a definition:
+
+> An environment Γ _corresponds_ to a store s, written Γ∼s if for every binding x\=v there is an entry Γ⊢x:T where Γ⊢!v:T.
+
+Here ⊢! denotes an exact typing relation, whose typing derivation ends with `All-I` or `{}-I` (so no subsumption or structural rules).
+
+By restating our theorems as follows, we can then prove them.
+
+*   **Preservation**: If Γ⊢t:T and G∼s and s∣t⟶s′∣t′ then there exists an environment Γ′⊂Γ such that Γ′⊢t′:T and Γ′∼s′.
+*   **Progress**: if Γ⊢t:T and Γ∼s then either t is a normal form, or s∣t⟶s′∣t′ for some store s′ and term t′.
