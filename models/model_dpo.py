@@ -365,7 +365,7 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             path_dataset = kwargs['path_dataset']
             path_index = kwargs['path_index']
-            path_rag = kwargs['path_rag']
+            path_rag = pretrained_model
 
             rag = RAG(
                 path_dataset=path_dataset, path_index=path_index, path_rag_hub=path_rag,
@@ -646,22 +646,9 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
         return output_dict
     
 
-    def prediction_step_mcqa(self, batch, tokenizer):
-        """
-        Computes the mcqa prediction of the given question.
 
-        Args:
-            batch (`list` of `dict`):
-                A list of dictionaries containing the input mcqa data for the DPO model.
-                The data format is as follows:
-                {
-                    "question": str,
-                    "answer": str,
-                }
-            tokenizer (`PreTrainedTokenizerBase`): The tokenizer used to tokenize the input questions.
-        Returns:
-            output_dict (`dict`): A dictionary containing the model predictions given input questions.
-        """
+    def prediction_step_mcqa(self, batch, tokenizer):
+
         output_dict = {"preds": []}
 
         ########################################################################
@@ -669,10 +656,9 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
         # ======================================================================
         # You need to return one letter prediction for each question.
         # ======================================================================
-# Addition text to guide the model for prediction
-        # 46% addition = "I give you a question and its answer. What is the letter of the correct answer as suggested in the answer? The correct letter is:"
+        # Addition text to guide the model for prediction
         start_text = "The following are multiple choice questions (with answers) about STEM.\n\n"
-                
+
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.pretrained_model.to(device)
 
@@ -684,90 +670,32 @@ class AutoDPOModelForSeq2SeqLM(PreTrainedModelWrapper):
             question = start_text + item[0] + " " + tokenizer.eos_token
 
             tokens = tokenizer(question, return_tensors="pt")
-
-            letters_pattern = re.compile(r'\n([A-Z])\. ')
-            matches = letters_pattern.findall(question.split('\nOptions:', 1)[1])
-
-            decoder_start_token_id = self.pretrained_model.config.decoder_start_token_id
-            decoder_input_ids = torch.tensor([[decoder_start_token_id]]).to(device)
-
-            with torch.no_grad():
-                outputs = self.pretrained_model(input_ids=tokens['input_ids'].to(device), attention_mask=tokens['attention_mask'].to(device), decoder_input_ids=decoder_input_ids)
-
-
-            logits_list = [outputs.logits[0][-1][tokenizer.convert_tokens_to_ids(i)] for i in matches]
-            logits = torch.tensor(logits_list)
-
-            probs = torch.nn.functional.softmax(logits)
-            print(probs)
-            # Create a dictionary to map indices to letters dynamically
-            index_to_letter = {index: letter for index, letter in enumerate(matches)}
-
-            # Get the predicted letter
-            pred = index_to_letter[torch.argmax(probs).item()]
-
-            output_dict["preds"].append(pred)
-
-        torch.cuda.empty_cache()
-
-        ########################################################################
-
-        return output_dict
-
-
-"""
-    def prediction_step_mcqa(self, batch, tokenizer):
-
-        output_dict = {"preds": []}
-
-        ########################################################################
-        # TODO: Please implement the prediction step that generates the prediction of the given MCQA question
-        # ======================================================================
-        # You need to return one letter prediction for each question.
-        # ======================================================================
-# Addition text to guide the model for prediction
-        # 46% addition = "I give you a question and its answer. What is the letter of the correct answer as suggested in the answer? The correct letter is:"
-        start_text = "The following are multiple choice questions (with answers) about STEM.\n\n"
-                
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.pretrained_model.to(device)
-
-        # Process each question-answer pair in the batch
-        questions = batch['question']
-        answers = batch['answer']
-        for item in zip(questions, answers):
-
-            question = start_text + item[0] + " " + tokenizer.eos_token
-
-            tokens = tokenizer(question, return_tensors="pt")
-
-            letters_pattern = re.compile(r'\n([A-Z])\. ')
-            matches = letters_pattern.findall(question.split('\nOptions:', 1)[1])
-
-            decoder_start_token_id = self.pretrained_model.config.decoder_start_token_id
-            decoder_input_ids = torch.tensor([[decoder_start_token_id]]).to(device)
 
             with torch.no_grad():
                 output = self.pretrained_model.generate(input_ids=tokens['input_ids'].to(device), attention_mask=tokens['attention_mask'].to(device), max_length=512, num_beams=1, early_stopping=True)
-
+            
             answer = tokenizer.decode(output[0], skip_special_tokens=True)
+            match = re.search(r'\(([A-Za-z])\)', answer[-20:])
 
-            match = re.search(r"The answer is \((\w)\)", answer)
             if match:
                 correct_letter = match.group(1)
-                print(f"Correct letter: {correct_letter}")
             else:
-                print("No answer letter found.")
+                with torch.no_grad():
+                    output = self.pretrained_model.generate(input_ids=tokens['input_ids'].to(device), attention_mask=tokens['attention_mask'].to(device), max_length=2048, no_repeat_ngram_size=5, num_beams=3, early_stopping=True)
 
-            #index_to_letter = {index: letter for index, letter in enumerate(matches)}
+                answer = tokenizer.decode(output[0], skip_special_tokens=True)
+                match = re.search(r'\(([A-Za-z])\)', answer[-20:])
+                if match:
+                    correct_letter = match.group(1)
+                else:
+                    correct_letter = 'A'
+                    print("No answer letter found twice.")
 
             # Get the predicted letter
-
-            output_dict["preds"].append(correct_letter)
+            output_dict["preds"].append(correct_letter.upper())
 
         torch.cuda.empty_cache()
 
         ########################################################################
 
         return output_dict
-"""

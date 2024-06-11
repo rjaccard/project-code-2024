@@ -50,11 +50,11 @@ class RAG(nn.Module):
     )
     """
 
-    def __init__(self, path_generator="jaffolte/rag_mcqa", 
-                 path_dataset="datasets/rag/rag_dataset", 
-                 path_index="datasets/rag/rag_dataset_index.faiss", 
+    def __init__(self, path_rag_hub, 
+                 path_dataset, 
+                 path_index, 
                  path_rag_local="checkpoints/rag", 
-                 path_rag_hub = "jaffolte/rag", auth_token=None, push_model_to_hub=False,
+                 path_generator = None, auth_token=None, push_model_to_hub=False,
                  configure_model=False, n_docs=5, max_combined_length=1024, device="cuda",
                  **kwargs) :
 
@@ -226,7 +226,7 @@ class RAG(nn.Module):
 
 
     def generate(self, questions,
-                 num_beams=2, do_sample=True, max_new_tokens=512, temperature=0.1, no_repeat_ngram_size=2, early_stopping=True) : 
+                 num_beams=2, do_sample=False, max_new_tokens=512, temperature=0.1, no_repeat_ngram_size=2, early_stopping=True) : 
         """Generate answers to questions using the RAG model.
         
         Args:
@@ -266,95 +266,6 @@ class RAG(nn.Module):
 
 
     def prediction_step_mcqa(self, batch, tokenizer):
-        """
-        Computes the mcqa prediction of the given question.
-
-        Args:
-            batch (`list` of `dict`):
-                A list of dictionaries containing the input mcqa data for the DPO model.
-                The data format is as follows:
-                {
-                    "question": str,
-                    "choices": List[str],
-                    "answer": str,
-                }
-            tokenizer (`PreTrainedTokenizerBase`): The tokenizer used to tokenize the input questions.
-        Returns:
-            output_dict (`dict`): A dictionary containing the model predictions given input questions.
-        """
-        output_dict = {"preds": []}
-
-        ########################################################################
-        # TODO: Please implement the prediction step that generates the prediction of the given MCQA question
-        # ======================================================================
-        # You need to return one letter prediction for each question.
-        # ======================================================================
-        
-        # Addition text to guide the model for prediction
-        start_text = "The following are multiple choice questions (with answers) about STEM. " 
-        rag_text = "You are given additional context using a RAG database. Please, check the relevance of context before answering. Do not take the context into account if it is not relevant.\n\n"
-        #rag_text = ""
-
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model.to(device)
-        print(f"Model: {self.model.device}")
-        # Process each question-answer pair in the batch
-        questions = batch['question']
-        answers = batch['answer']
-
-        for item in zip(questions, answers):
-            
-            # Tokenize the question.
-            question = start_text + rag_text + item[0] + " " + self.tokenizer.generator.eos_token
-            inputs = self.tokenizer.question_encoder(question, return_tensors="pt", padding="max_length", truncation=True, max_length=512).to(self.device)
-
-            # Retrieve the options from the question
-            letters_pattern = re.compile(r'\n([A-Z])\. ')
-            matches = letters_pattern.findall(question.split('\nOptions:', 1)[1])
-            #matches = [match.lower() for match in matches]
-            #print(matches)
-            decoder_start_token_id = self.model.config.generator.decoder_start_token_id
-            decoder_input_ids = torch.tensor([[decoder_start_token_id]]).to(self.device)
-            
-            # Retrieve the logits for each option
-            with torch.no_grad():
-                outputs = self.model(**inputs, decoder_input_ids=decoder_input_ids, n_docs=2)
-                #print(outputs)
-
-
-            #print(outputs["context_input_ids"][0])
-            #print(tokenizer.decode(outputs["context_input_ids"][0], skip_special_tokens=True))
-            #print(outputs.logits)
-            #print(self.tokenizer.generator('A')['input_ids'])
-            #print(self.tokenizer.generator('a')['input_ids'])
-            #print(self.tokenizer.generator('b')['input_ids'])
-            #print(matches)
-
-
-            logits_list = [outputs.logits[0][-1][self.tokenizer.generator.convert_tokens_to_ids(i)] for i in matches]
-            logits = torch.tensor(logits_list)
-
-            # Get the probabilities of each option
-            probs = torch.nn.functional.softmax(logits)
-
-            # Create a dictionary to map indices to letters dynamically
-            index_to_letter = {index: letter for index, letter in enumerate(matches)}
-
-            # Get the predicted letter
-            pred = index_to_letter[torch.argmax(probs).item()]
-            output_dict["preds"].append(pred.upper())
-
-            print(f"A: {item[1]} | P: {pred} | {probs}")
-
-        torch.cuda.empty_cache()
-
-        ########################################################################
-
-        return output_dict
-
-
-"""
-    def prediction_step_mcqa(self, batch, tokenizer):
 
         output_dict = {"preds": []}
 
@@ -376,36 +287,28 @@ class RAG(nn.Module):
             
             # Tokenize the question.
             question = start_text + rag_text + item[0] + " " + self.tokenizer.generator.eos_token
-            inputs = self.tokenizer(question, return_tensors="pt", padding="max_length", truncation=True, max_length=512).to(self.device)
-
-            # Retrieve the options from the question
-            letters_pattern = re.compile(r'\n([A-Z])\. ')
-            matches = letters_pattern.findall(question.split('\nOptions:', 1)[1])
-
-            #decoder_start_token_id = self.rag_model.config.generator.decoder_start_token_id
-            #decoder_input_ids = torch.tensor([[decoder_start_token_id]]).to(device)
-            
 
             with torch.no_grad():
-                output = self.generate(question, max_new_tokens=512, num_beams=1, early_stopping=True)
+                answer = self.generate(question, max_new_tokens=2024, num_beams=1, early_stopping=True)
 
-            print(output)
-            answer = output
-
-            match = re.search(r"The answer is \((\w)\)", answer)
+            match = re.search(r'\(([A-Za-z])\)', answer[-20:])
+            
             if match:
                 correct_letter = match.group(1)
-                print(f"Correct letter: {correct_letter}")
             else:
-                print("No answer letter found.")
-
-            #index_to_letter = {index: letter for index, letter in enumerate(matches)}
+                # Try again with a different beam size
+                with torch.no_grad():
+                    answer = self.generate(question, max_new_tokens=1024, num_beams=3, no_repeat_ngram_size=5, early_stopping=True)
+                match = re.search(r'\(([A-Za-z])\)', answer[-20:])
+                if match:
+                    correct_letter = match.group(1)
+                else:
+                    correct_letter = 'A'
 
             # Get the predicted letter
 
-            output_dict["preds"].append(correct_letter)
+            output_dict["preds"].append(correct_letter.upper())
 
         torch.cuda.empty_cache()
 
         return output_dict
-"""
